@@ -1,8 +1,9 @@
 // AUTOGENERADO por scripts/compile_kernel.py -- NO EDITAR A MANO.
 // Fuente: src/kernels/matmul.cu
+// Solo datos (cubins embebidos). Sin efectos secundarios --
+// seguro de incluir desde cualquier translation unit.
 #pragma once
 #include <cstddef>
-#include "../registry.h"
 
 namespace yadrakova::embedded {
 namespace sm_86 {
@@ -1214,16 +1215,3 @@ inline constexpr unsigned char matmul_int8[] = {
 inline constexpr size_t matmul_int8_size = sizeof(matmul_int8);
 } // namespace sm_86
 } // namespace yadrakova::embedded
-
-namespace yadrakova::kernels::registration_matmul {
-struct MatmulRegistrar {
-    MatmulRegistrar() {
-        auto& reg = KernelRegistry::instance();
-        reg.register_kernel("matmul", Arch::SM_86, core::DType::BF16, {embedded::sm_86::matmul_bf16, embedded::sm_86::matmul_bf16_size});
-        reg.register_kernel("matmul", Arch::SM_86, core::DType::FP32, {embedded::sm_86::matmul_fp32, embedded::sm_86::matmul_fp32_size});
-        reg.register_kernel("matmul", Arch::SM_86, core::DType::FP16, {embedded::sm_86::matmul_fp16, embedded::sm_86::matmul_fp16_size});
-        reg.register_kernel("matmul", Arch::SM_86, core::DType::INT8, {embedded::sm_86::matmul_int8, embedded::sm_86::matmul_int8_size});
-    }
-};
-MatmulRegistrar instance;
-} // namespace
