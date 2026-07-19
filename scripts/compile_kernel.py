@@ -75,17 +75,23 @@ def embed_cubin_bytes(cubin_path: Path, var_name: str) -> str:
 
 
 def generate_header(kernel_name: str, archs: list, dtypes: list,
-                    cubins: dict, output_path: Path):
-    dtype_enum = {"bf16": "DType::BF16", "fp32": "DType::FP32",
-                  "fp16": "DType::FP16", "int8": "DType::INT8"}
+                    cubins: dict, output_path: Path, registry_header: Path):
+    dtype_enum = {"bf16": "core::DType::BF16", "fp32": "core::DType::FP32",
+                  "fp16": "core::DType::FP16", "int8": "core::DType::INT8"}
     arch_enum = {"sm_86": "Arch::SM_86", "sm_100": "Arch::SM_100"}
+
+    # Ruta relativa calculada, no hardcodeada -- se auto-ajusta si
+    # output_dir cambia de profundidad relativa a registry.h.
+    registry_include = Path(
+        __import__("os").path.relpath(registry_header, output_path.parent)
+    ).as_posix()
 
     lines = [
         "// AUTOGENERADO por scripts/compile_kernel.py -- NO EDITAR A MANO.",
         f"// Fuente: src/kernels/{kernel_name}.cu",
         "#pragma once",
         "#include <cstddef>",
-        '#include "kernels/registry.h"',
+        f'#include "{registry_include}"',
         "",
         "namespace yadrakova::embedded {",
     ]
@@ -101,6 +107,10 @@ def generate_header(kernel_name: str, archs: list, dtypes: list,
     # objeto estatico se construye antes de main() y registra los
     # 4 dtypes x N archs en el KernelRegistry global. Cero pasos
     # manuales -- igual que "registrar shaders" en tu sistema Vulkan.
+    # ... (código anterior dentro de generate_header igual)
+
+    # Auto-registro: al compilar este .cpp, el objeto estático se construye
+    # antes de main() y registra los dtypes x archs en el KernelRegistry.
     lines.append("")
     lines.append(f"namespace yadrakova::kernels::registration_{kernel_name} {{")
     lines.append(f"struct {kernel_name.capitalize()}Registrar {{")
@@ -115,7 +125,9 @@ def generate_header(kernel_name: str, archs: list, dtypes: list,
             )
     lines.append("    }")
     lines.append("};")
-    lines.append(f"inline {kernel_name.capitalize()}Registrar instance;")
+
+    # CAMBIO AQUÍ: Eliminamos la palabra 'inline'
+    lines.append(f"{kernel_name.capitalize()}Registrar instance;")
     lines.append("} // namespace")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +146,7 @@ def main():
     dtypes = config["kernels"]["dtypes"]
     src_dir = Path(config["kernels"]["source_dir"])
     out_dir = Path(config["kernels"]["output_dir"])
+    registry_header = Path("include/kernels/registry.h")
     cache_dir = Path(config["cache"]["dir"])
 
     try:
@@ -156,9 +169,11 @@ def main():
             for dtype in dtypes:
                 cubins[(arch, dtype)] = compile_one(
                     source, dtype, arch, cache_dir, extra_flags, nvcc_ver)
-        out_header = out_dir / f"{kernel_name}_embedded.cuh"
-        generate_header(kernel_name, archs, dtypes, cubins, out_header)
-        print(f"  -> {out_header}")
+
+        # CAMBIO AQUÍ: Ahora la extensión de salida es .cpp en lugar de .cuh
+        out_source = out_dir / f"{kernel_name}_embedded.cpp"
+        generate_header(kernel_name, archs, dtypes, cubins, out_source, registry_header)
+        print(f"  -> {out_source}")
 
 
 if __name__ == "__main__":

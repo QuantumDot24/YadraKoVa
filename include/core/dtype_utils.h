@@ -8,7 +8,6 @@
 
 namespace yadrakova::core {
 
-// --- el tipo base: todo lo demas en el core lo consume desde aqui -------
 
 enum class DType : uint8_t { BF16, FP32, FP16, INT8 };
 

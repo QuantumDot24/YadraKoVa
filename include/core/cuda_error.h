@@ -11,7 +11,7 @@ public:
     CudaError(cudaError_t err, const char* expr, const char* file, int line,
                const std::string& context = "")
         : std::runtime_error(build(err, expr, file, line, context)), code_(err) {}
-    cudaError_t code() const noexcept { return code_; }
+    [[nodiscard]] cudaError_t code() const noexcept { return code_; }
 private:
     cudaError_t code_;
     static std::string build(cudaError_t err, const char* expr, const char* file, int line,

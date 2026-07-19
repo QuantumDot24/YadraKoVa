@@ -2,7 +2,7 @@
 // Fuente: src/kernels/matmul.cu
 #pragma once
 #include <cstddef>
-#include "kernels/registry.h"
+#include "../registry.h"
 
 namespace yadrakova::embedded {
 namespace sm_86 {
@@ -1219,11 +1219,11 @@ namespace yadrakova::kernels::registration_matmul {
 struct MatmulRegistrar {
     MatmulRegistrar() {
         auto& reg = KernelRegistry::instance();
-        reg.register_kernel("matmul", Arch::SM_86, DType::BF16, {embedded::sm_86::matmul_bf16, embedded::sm_86::matmul_bf16_size});
-        reg.register_kernel("matmul", Arch::SM_86, DType::FP32, {embedded::sm_86::matmul_fp32, embedded::sm_86::matmul_fp32_size});
-        reg.register_kernel("matmul", Arch::SM_86, DType::FP16, {embedded::sm_86::matmul_fp16, embedded::sm_86::matmul_fp16_size});
-        reg.register_kernel("matmul", Arch::SM_86, DType::INT8, {embedded::sm_86::matmul_int8, embedded::sm_86::matmul_int8_size});
+        reg.register_kernel("matmul", Arch::SM_86, core::DType::BF16, {embedded::sm_86::matmul_bf16, embedded::sm_86::matmul_bf16_size});
+        reg.register_kernel("matmul", Arch::SM_86, core::DType::FP32, {embedded::sm_86::matmul_fp32, embedded::sm_86::matmul_fp32_size});
+        reg.register_kernel("matmul", Arch::SM_86, core::DType::FP16, {embedded::sm_86::matmul_fp16, embedded::sm_86::matmul_fp16_size});
+        reg.register_kernel("matmul", Arch::SM_86, core::DType::INT8, {embedded::sm_86::matmul_int8, embedded::sm_86::matmul_int8_size});
     }
 };
-inline MatmulRegistrar instance;
+MatmulRegistrar instance;
 } // namespace

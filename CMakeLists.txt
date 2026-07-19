@@ -24,6 +24,8 @@ file(GLOB_RECURSE YADRAKOVA_CORE_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/core/*.cu"
         "${CMAKE_SOURCE_DIR}/src/telemetry/*.cpp"
         "${CMAKE_SOURCE_DIR}/src/train/*.cpp"
+        # ¡ESTO ES LO IMPORTANTE!: CMake detectará automáticamente tus .cpp autogenerados
+        "${CMAKE_SOURCE_DIR}/include/kernels/embedded/*.cpp"
 )
 
 file(GLOB_RECURSE YADRAKOVA_HEADERS CONFIGURE_DEPENDS
@@ -38,16 +40,14 @@ file(GLOB_RECURSE YADRAKOVA_TEST_SOURCES CONFIGURE_DEPENDS
 file(GLOB KERNEL_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.cu")
 
 # ---------------------------------------------------------------------------
-# Codegen de kernels: compila .cu -> .cubin -> .cuh embebido ANTES de
-# que cualquier target intente incluir esos headers. Debe declararse
-# antes de la libreria que depende de el.
+# Codegen de kernels
 # ---------------------------------------------------------------------------
 add_custom_target(kernel_codegen
         COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/compile_kernel.py
         --config ${CMAKE_SOURCE_DIR}/config.yaml
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         DEPENDS ${KERNEL_SOURCES} ${CMAKE_SOURCE_DIR}/scripts/compile_kernel.py ${CMAKE_SOURCE_DIR}/config.yaml
-        COMMENT "Compilando y embebiendo kernels CUDA (.cu -> .cubin -> .cuh)"
+        COMMENT "Compilando y embebiendo kernels CUDA"
 )
 
 # ---------------------------------------------------------------------------
@@ -64,16 +64,15 @@ set_target_properties(yadrakova_core PROPERTIES
         POSITION_INDEPENDENT_CODE ON
 )
 
-# cudart: runtime API (cudaMalloc, cudaMemcpy, streams, events, graphs)
-# cuda_driver: driver API (cuModuleLoadData, cuLaunchKernel) -- necesario
-# para el registry.h que carga cubins embebidos.
 target_link_libraries(yadrakova_core PUBLIC
         CUDA::cudart
         CUDA::cuda_driver
 )
 
-# La libreria necesita que los .cuh embebidos existan ANTES de compilarse.
 add_dependencies(yadrakova_core kernel_codegen)
+
+# !!! AQUÍ ELIMINAMOS POR COMPLETO EL BUCLE FOREACH DE LOS TARGET_COMPILE_OPTIONS !!!
+# Ya no inyectamos el .cpp en ningún lado.
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -84,12 +83,19 @@ foreach(test_src ${YADRAKOVA_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
     target_link_libraries(${test_name} PRIVATE yadrakova_core)
+
+    # OBLIGATORIO PARA WINDOWS: Evita que el linker borre los .cpp de registro
+    if(MSVC)
+        target_link_options(${test_name} PRIVATE "/WHOLEARCHIVE:yadrakova_core")
+    else()
+        target_link_options(${test_name} PRIVATE "-Wl,--whole-archive" yadrakova_core "-Wl,--no-whole-archive")
+    endif()
+
     set_target_properties(${test_name} PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
     )
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
-
 # ---------------------------------------------------------------------------
 # Diagnostico
 # ---------------------------------------------------------------------------
