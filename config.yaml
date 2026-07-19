@@ -1,0 +1,17 @@
+hardware_profile: rtx3060_laptop
+
+cuda:
+  architectures: [sm_86]
+  arch_flags:
+    sm_86:
+      extra_flags: []
+    # sm_100:
+    #   extra_flags: ["-DBLACKWELL_TENSOR_CORES"]
+
+kernels:
+  dtypes: [bf16, fp32, fp16, int8]
+  source_dir: src/kernels
+  output_dir: include/kernels/embedded
+
+cache:
+  dir: .kernel_cache
