@@ -1,0 +1,21 @@
+# src/kernels/softmax.yaml
+kernel: softmax
+
+block: [32, 1, 1]
+
+dims: [rows, cols]
+grid: { x: rows }
+
+shared_mem_bytes: 0
+
+args:
+  - name: input
+    kind: in
+  - name: output
+    kind: out
+  - name: rows
+    kind: scalar
+    dtype: int64
+  - name: cols
+    kind: scalar
+    dtype: int64

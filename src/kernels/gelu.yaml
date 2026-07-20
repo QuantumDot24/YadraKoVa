@@ -1,0 +1,18 @@
+# src/kernels/gelu.yaml
+kernel: gelu
+
+block: [256, 1, 1]
+
+dims: [n]
+grid: elementwise(n)
+
+shared_mem_bytes: 0
+
+args:
+  - name: input
+    kind: in
+  - name: output
+    kind: out
+  - name: n
+    kind: scalar
+    dtype: int64

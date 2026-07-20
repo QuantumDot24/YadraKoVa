@@ -35,9 +35,8 @@ import hashlib
 import os
 import subprocess
 import sys
-from pathlib import Path
-
 import yaml  # pip install pyyaml
+from pathlib import Path
 
 DTYPE_TO_CPP = {
     "bf16": "__nv_bfloat16",
@@ -296,14 +295,113 @@ def find_dispatch_yaml(source: Path) -> Path | None:
     return yaml_path if yaml_path.exists() else None
 
 
-def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict,
+import re
+
+SIG_RE = re.compile(
+    r'__global__\s+void\s+\w+_kernel\s*\((.*?)\)\s*\{',
+    re.DOTALL
+)
+
+
+def parse_kernel_signature(source_text: str) -> list[tuple[str, str]]:
+    """Devuelve [(tipo_cpp, nombre), ...] en orden, desde la firma real."""
+    m = SIG_RE.search(source_text)
+    if not m:
+        raise ValueError("No se encontro __global__ ...(...) { en el kernel")
+    params = [p.strip() for p in m.group(1).split(",") if p.strip()]
+    result = []
+    for p in params:
+        parts = p.replace("*", " * ").split()
+        name = parts[-1]
+        type_str = " ".join(parts[:-1]).replace(" * ", "*").strip()
+        result.append((type_str, name))
+    return result
+
+
+def validate_args_match(kernel_name: str, source_text: str, yaml_args: list):
+    real_sig = parse_kernel_signature(source_text)
+    if len(real_sig) != len(yaml_args):
+        raise ValueError(
+            f"'{kernel_name}': yaml declara {len(yaml_args)} args, "
+            f"la firma real tiene {len(real_sig)}"
+        )
+    for (real_type, real_name), decl in zip(real_sig, yaml_args):
+        if real_name != decl["name"]:
+            raise ValueError(
+                f"'{kernel_name}': orden/nombre no coincide -- yaml dice "
+                f"'{decl['name']}', firma real dice '{real_name}'"
+            )
+        if decl["kind"] in ("in", "out") and "*" not in real_type:
+            raise ValueError(
+                f"'{kernel_name}.{real_name}': yaml dice kind={decl['kind']} "
+                f"(deberia ser puntero) pero la firma real es '{real_type}'"
+            )
+        expected_scalar = {"int64": "int64_t", "int32": "int"}.get(decl.get("dtype", ""))
+        if decl["kind"] == "scalar" and expected_scalar and expected_scalar not in real_type:
+            raise ValueError(
+                f"'{kernel_name}.{real_name}': yaml declara dtype={decl['dtype']} "
+                f"pero la firma real es '{real_type}'"
+            )
+
+
+def parse_grid_spec(grid_field, block: list, dim_names: list) -> dict:
+    """Igual que antes, pero valida contra `dims:` del yaml en vez de
+    contra M/N/K fijos -- cualquier kernel puede nombrar sus propias
+    dimensiones."""
+    dims = {"x": "1", "y": "1", "z": "1"}
+    block_by_dim = {"x": block[0], "y": block[1], "z": block[2] if len(block) > 2 else 1}
+
+    if isinstance(grid_field, str):
+        grid_field = grid_field.strip()
+        name, _, inner = grid_field.partition("(")
+        name = name.strip()
+        if name not in GRID_HELPERS or not inner.endswith(")"):
+            raise ValueError(
+                f"grid: '{grid_field}' no reconocido. Usa uno de "
+                f"{list(GRID_HELPERS)}(...) o la forma explicita {{x: .., y: ..}}"
+            )
+        arg_names = [a.strip() for a in inner[:-1].split(",") if a.strip()]
+        target_dims = GRID_HELPERS[name]
+        if len(arg_names) != len(target_dims):
+            raise ValueError(
+                f"grid: '{grid_field}' espera {len(target_dims)} argumento(s), "
+                f"recibio {len(arg_names)}"
+            )
+        for var_name, dim in zip(arg_names, target_dims):
+            if var_name not in dim_names:
+                raise ValueError(
+                    f"grid: '{var_name}' no esta declarado en 'dims: {dim_names}' -- revisa {grid_field}"
+                )
+            dims[dim] = _ceildiv_expr(var_name, block_by_dim[dim])
+        return dims
+
+    if isinstance(grid_field, dict):
+        for dim in ("x", "y", "z"):
+            if dim in grid_field:
+                dims[dim] = str(grid_field[dim])
+        return dims
+
+    raise ValueError(f"grid: tipo no soportado ({type(grid_field).__name__}); usa string o dict")
+
+
+def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
                        dispatch_cpp_path: Path, dispatch_registry_header: Path):
-    """Escribe el .cpp de registro de dispatch -- efecto secundario
-    analogo a write_registration_cpp, pero para DispatchRegistry en
-    vez de KernelRegistry."""
+    """Escribe el .cpp de registro de dispatch. Ahora valida yaml vs
+    firma real ANTES de generar, y arma la lambda sobre DimMap en vez
+    de M,N,K posicionales fijos."""
     if kernel_yaml.get("kernel", kernel_name) != kernel_name:
         print(f"  [WARN] 'kernel:' en el yaml no coincide con el nombre de archivo "
               f"({kernel_yaml.get('kernel')!r} vs {kernel_name!r})", file=sys.stderr)
+
+    dim_names = kernel_yaml.get("dims")
+    if not dim_names:
+        raise ValueError(f"'{kernel_name}.yaml' no define 'dims:' (ej. [M, N, K] o [n])")
+
+    yaml_args = kernel_yaml.get("args")
+    if not yaml_args:
+        raise ValueError(f"'{kernel_name}.yaml' no define 'args:'")
+
+    validate_args_match(kernel_name, source_text, yaml_args)
 
     block = list(kernel_yaml.get("block", [1, 1, 1]))
     while len(block) < 3:
@@ -318,13 +416,15 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict,
     grid_field = kernel_yaml.get("grid")
     if grid_field is None:
         raise ValueError(f"'{kernel_name}.yaml' no define 'grid'")
-    grid = parse_grid_spec(grid_field, block)
+    grid = parse_grid_spec(grid_field, block, dim_names)
 
     shared_mem = int(kernel_yaml.get("shared_mem_bytes", 0))
 
     registry_include = Path(os.path.relpath(dispatch_registry_header, dispatch_cpp_path.parent)).as_posix()
     class_name = f"{kernel_name.capitalize()}DispatchRegistrar"
     fn_name = f"compute_{kernel_name}_dispatch"
+
+    dim_extract_lines = [f'    int64_t {name} = dims.at("{name}");' for name in dim_names]
 
     lines = [
         "// AUTOGENERADO por scripts/compile_kernel.py -- NO EDITAR A MANO.",
@@ -333,16 +433,17 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict,
         "",
         f"namespace yadrakova::kernels::dispatch_{kernel_name} {{",
         "",
-        f"core::DispatchDims {fn_name}(int64_t M, int64_t N, int64_t K) {{",
-        "    core::DispatchDims dims;",
-        f"    dims.block = core::Dim3{{{block[0]}u, {block[1]}u, {block[2]}u}};",
-        "    dims.grid = core::Dim3{",
+        f"core::DispatchDims {fn_name}(const core::DimMap& dims) {{",
+        "    core::DispatchDims out;",
+        *dim_extract_lines,
+        f"    out.block = core::Dim3{{{block[0]}u, {block[1]}u, {block[2]}u}};",
+        "    out.grid = core::Dim3{",
         f"        static_cast<unsigned int>({grid['x']}),",
         f"        static_cast<unsigned int>({grid['y']}),",
         f"        static_cast<unsigned int>({grid['z']})",
         "    };",
-        f"    dims.shared_mem_bytes = {shared_mem}u;",
-        "    return dims;",
+        f"    out.shared_mem_bytes = {shared_mem}u;",
+        "    return out;",
         "}",
         "",
         f"struct {class_name} {{",
@@ -428,8 +529,9 @@ def main():
         else:
             with open(yaml_path, encoding="utf-8") as f:
                 kernel_yaml = yaml.safe_load(f)
+            source_text = source.read_text(encoding="utf-8")
             dispatch_cpp_path = cpp_out_dir / f"{kernel_name}_dispatch.generated.cpp"
-            write_dispatch_cpp(kernel_name, kernel_yaml, dispatch_cpp_path, dispatch_registry_header)
+            write_dispatch_cpp(kernel_name, kernel_yaml, source_text, dispatch_cpp_path, dispatch_registry_header)
             print(f"  -> {dispatch_cpp_path}")
 
     # Prune final: kernels renombrados/eliminados desde la ultima corrida.

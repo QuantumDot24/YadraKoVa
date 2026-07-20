@@ -14,7 +14,8 @@ block: [16, 16, 1]
 #   grid.z = 1
 # filas/columnas deben ser nombres definidos en args (M, N o K).
 grid: tile2d(M, N)
-
+# matmul.yaml -- agregar esta línea
+dims: [M, N, K]
 # Memoria compartida dinamica en bytes (opcional, default 0).
 shared_mem_bytes: 0
 

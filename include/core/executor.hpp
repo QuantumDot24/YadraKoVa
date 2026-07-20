@@ -12,29 +12,27 @@ namespace yadrakova::core {
 
     class Executor {
     public:
-        // args ya debe traer TODOS los punteros del kernel en el orden
-        // exacto de su firma (incluyendo M, N, K si el kernel los recibe
-        // como escalares -- Executor no los inserta, porque no sabe la
-        // firma del kernel; eso lo decide quien arma args, ej. Tensor::matmul).
+        // dims: mapa nombrado (ej. {"M":64,"N":64,"K":64} o {"n":4096}),
+        // debe coincidir con los nombres declarados en `dims:` del yaml
+        // del kernel. args ya trae todos los punteros/escalares en el
+        // orden exacto de la firma real (ver args: del yaml).
         template <typename T>
         static void execute(const std::string& kernel_name,
-                            int64_t M, int64_t N, int64_t K, // solo para DispatchRegistry
+                            const DimMap& dims,
                             const std::vector<void*>& args,
                             Stream& stream)
         {
             DType dtype = dtype_traits<T>::value;
 
-            // TODO: leer de un contexto global de dispositivo mas adelante;
-            // por ahora, arquitectura nativa fija.
             constexpr kernels::Arch current_arch = kernels::Arch::SM_86;
 
             CUfunction fn = kernels::KernelRegistry::instance().get_function(kernel_name, current_arch, dtype);
-            DispatchDims dims = DispatchRegistry::instance().get_dims(kernel_name, M, N, K);
+            DispatchDims d = DispatchRegistry::instance().get_dims(kernel_name, dims);
 
             CU_CHECK(cuLaunchKernel(fn,
-                                     dims.grid.x,  dims.grid.y,  dims.grid.z,
-                                     dims.block.x, dims.block.y, dims.block.z,
-                                     dims.shared_mem_bytes,
+                                     d.grid.x,  d.grid.y,  d.grid.z,
+                                     d.block.x, d.block.y, d.block.z,
+                                     d.shared_mem_bytes,
                                      stream.raw(),
                                      const_cast<void**>(args.data()),
                                      nullptr));

@@ -2,7 +2,7 @@
 // warp por block (asume N <= 32 por ahora -- version simple para
 // probar common.cuh; softmax de N arbitrario con multiples warps
 // es un paso posterior).
-#include "kernels/common.cuh"
+#include "../../include/kernels/common.cuh"
 
 #ifndef KERNEL_DTYPE
 #define KERNEL_DTYPE float
@@ -11,7 +11,7 @@
 using namespace yadrakova::kernels::common;
 
 extern "C" __global__ void softmax_kernel(
-    const KERNEL_DTYPE* input, KERNEL_DTYPE* output, int rows, int cols)
+    const KERNEL_DTYPE* input, KERNEL_DTYPE* output, int64_t rows, int64_t cols)
 {
     int row = blockIdx.x;
     int tid = threadIdx.x; // 0..31, un warp

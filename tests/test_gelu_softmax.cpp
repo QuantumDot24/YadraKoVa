@@ -1,16 +1,11 @@
 #include "core/tensor.hpp"
-#include "core/stream.hpp"
-#include "kernels/registry.hpp"
-#include "kernels/embedded/gelu_embedded.cuh"
-#include "kernels/embedded/softmax_embedded.cuh"
 #include <vector>
-#include <random>
 #include <cmath>
+#include <algorithm>
 #include <cassert>
 #include <iostream>
 
 using namespace yadrakova::core;
-using namespace yadrakova::kernels;
 
 // Referencias CPU -- fuente de verdad.
 float cpu_gelu(float x) {
@@ -31,29 +26,12 @@ std::vector<float> cpu_softmax_row(const std::vector<float>& row) {
 
 void test_gelu_correctness() {
     const int N = 1024;
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
 
-    std::vector<float> h_in(N);
-    for (auto& v : h_in) v = dist(rng);
+    Tensor<float> A = Tensor<float>::randn({N});
+    Tensor<float> C = A.gelu();
 
-    Tensor<float> d_in({N});
-    Tensor<float> d_out({N});
-    cudaMemcpy(d_in.data(), h_in.data(), N * sizeof(float), cudaMemcpyHostToDevice);
-
-    CUfunction fn = KernelRegistry::instance().get_function("gelu", Arch::SM_86, DType::FP32);
-
-    float* in_ptr = d_in.data();
-    float* out_ptr = d_out.data();
-    void* args[] = { &in_ptr, &out_ptr, (void*)&N };
-
-    int threads = 256;
-    int blocks = (N + threads - 1) / threads;
-    cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr);
-    cudaDeviceSynchronize();
-
-    std::vector<float> h_out(N);
-    cudaMemcpy(h_out.data(), d_out.data(), N * sizeof(float), cudaMemcpyDeviceToHost);
+    auto h_in = A.to_vector();
+    auto h_out = C.to_vector();
 
     float max_diff = 0.0f;
     for (int i = 0; i < N; ++i)
@@ -66,28 +44,12 @@ void test_gelu_correctness() {
 
 void test_softmax_correctness() {
     const int rows = 4, cols = 16; // cols <= 32 para esta version simple
-    std::mt19937 rng(7);
-    std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
 
-    std::vector<float> h_in(rows * cols);
-    for (auto& v : h_in) v = dist(rng);
+    Tensor<float> A = Tensor<float>::randn({rows, cols});
+    Tensor<float> C = A.softmax();
 
-    Tensor<float> d_in({rows, cols});
-    Tensor<float> d_out({rows, cols});
-    cudaMemcpy(d_in.data(), h_in.data(), h_in.size() * sizeof(float), cudaMemcpyHostToDevice);
-
-    CUfunction fn = KernelRegistry::instance().get_function("softmax", Arch::SM_86, DType::FP32);
-
-    float* in_ptr = d_in.data();
-    float* out_ptr = d_out.data();
-    void* args[] = { &in_ptr, &out_ptr, (void*)&rows, (void*)&cols };
-
-    // Un block por fila, un warp (32 threads) por block.
-    cuLaunchKernel(fn, rows, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr);
-    cudaDeviceSynchronize();
-
-    std::vector<float> h_out(rows * cols);
-    cudaMemcpy(h_out.data(), d_out.data(), h_out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    auto h_in = A.to_vector();
+    auto h_out = C.to_vector();
 
     float max_diff = 0.0f;
     for (int r = 0; r < rows; ++r) {
@@ -103,8 +65,13 @@ void test_softmax_correctness() {
 }
 
 int main() {
-    test_gelu_correctness();
-    test_softmax_correctness();
-    std::cout << "Todos los tests de gelu/softmax pasaron.\n";
+    try {
+        test_gelu_correctness();
+        test_softmax_correctness();
+        std::cout << "Todos los tests de gelu/softmax pasaron.\n";
+    } catch (const std::exception& e) {
+        std::cerr << "EXCEPCION: " << e.what() << "\n";
+        return 1;
+    }
     return 0;
 }

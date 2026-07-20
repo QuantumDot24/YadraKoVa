@@ -168,7 +168,54 @@ namespace yadrakova::core
             assert(std::accumulate(new_shape.begin(), new_shape.end(), int64_t{1}, std::multiplies<>()) == numel());
             return Tensor(buffer_, std::move(new_shape), contiguous_strides(new_shape), offset_);
         }
+        // --- activaciones / normalizacion: dispatch autogenerado via Executor ---
 
+        // Elementwise, cualquier shape -- opera sobre numel() elementos planos.
+        Tensor gelu(Stream& stream = default_stream()) const
+        {
+            if (!is_contiguous())
+                throw std::runtime_error(
+                    "gelu: tensor no contiguo (view de transpose/permute/slice). "
+                    "Materializa una copia contigua antes de aplicar gelu.");
+
+            Tensor<T> out(shape_);
+
+            const T* in_ptr = this->data_ptr_;
+            T* out_ptr = out.data_ptr_;
+            int64_t n = numel();
+
+            std::vector<void*> args = { &in_ptr, &out_ptr, &n };
+
+            Executor::execute<T>("gelu", DimMap{{"n", n}}, args, stream);
+            return out;
+        }
+
+        // Softmax por fila -- requiere 2D. La version actual del kernel asume
+        // cols <= 32 (un warp por fila); shapes mas anchos necesitaran un
+        // kernel multi-warp aparte mas adelante.
+        Tensor softmax(Stream& stream = default_stream()) const
+        {
+            if (ndim() != 2)
+                throw std::runtime_error(
+                    "softmax: se espera un tensor 2D (ndim()=" + std::to_string(ndim()) + ")");
+            if (!is_contiguous())
+                throw std::runtime_error(
+                    "softmax: tensor no contiguo (view de transpose/permute/slice). "
+                    "Materializa una copia contigua antes de aplicar softmax.");
+
+            const int64_t rows = shape_[0];
+            const int64_t cols = shape_[1];
+
+            Tensor<T> out(shape_);
+
+            const T* in_ptr = this->data_ptr_;
+            T* out_ptr = out.data_ptr_;
+
+            std::vector<void*> args = { &in_ptr, &out_ptr, (void*)&rows, (void*)&cols };
+
+            Executor::execute<T>("softmax", DimMap{{"rows", rows}, {"cols", cols}}, args, stream);
+            return out;
+        }
         // --- algebra: dispatch autogenerado via Executor ---
         //
         // Solo 2D por ahora (el kernel naive no soporta batching).
@@ -222,7 +269,7 @@ namespace yadrakova::core
                 &a_ptr, &b_ptr, &c_ptr, (void*)&M, (void*)&N, (void*)&K
             };
 
-            Executor::execute<T>("matmul", M, N, K, args, stream);
+            Executor::execute<T>("matmul", DimMap{{"M", M}, {"N", N}, {"K", K}}, args, stream);
             return C;
         }
 
