@@ -1,9 +1,8 @@
 #pragma once
-#include "core/graph.h"
-#include "core/stream.h"
+#include "core/graph.hpp"
+#include "core/stream.hpp"
 #include <unordered_map>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <functional>
 
@@ -23,53 +22,29 @@ namespace yadrakova::core {
 // caller tenga que gestionar los Streams a mano.
 class GraphManager {
 public:
-    explicit GraphManager(MemoryPool& pool = default_pool()) : pool_(pool) {}
+    explicit GraphManager(MemoryPool& pool = default_pool());
 
     // Crea (o retorna, si ya existe) el Graph con este nombre.
-    Graph& get_or_create(const std::string& name) {
-        auto it = graphs_.find(name);
-        if (it != graphs_.end()) return *it->second;
+    Graph& get_or_create(const std::string& name);
 
-        auto [inserted_it, ok] = graphs_.emplace(name, std::make_unique<Graph>(name));
-        return *inserted_it->second;
-    }
+    Graph& get(const std::string& name);
 
-    Graph& get(const std::string& name) {
-        auto it = graphs_.find(name);
-        if (it == graphs_.end()) {
-            throw std::runtime_error("GraphManager: no existe un Graph llamado '" + name + "'.");
-        }
-        return *it->second;
-    }
-
-    bool has(const std::string& name) const {
-        return graphs_.find(name) != graphs_.end();
-    }
+    bool has(const std::string& name) const;
 
     // Devuelve el Stream dedicado de este nombre, creandolo si no existe.
     // El nombre aqui no tiene que coincidir con un Graph -- puedes pedir
     // stream_for("telemetry") aunque el Graph se llame distinto, aunque
     // en el caso comun ambos nombres van a coincidir.
-    Stream& stream_for(const std::string& name) {
-        auto it = owned_streams_.find(name);
-        if (it == owned_streams_.end()) {
-            it = owned_streams_.emplace(name, std::make_unique<Stream>()).first;
-        }
-        return *it->second;
-    }
+    Stream& stream_for(const std::string& name);
 
     // Atajo: lanza un grafo ya instanciado por nombre, en el Stream
     // que el caller pase explicitamente (comportamiento original).
-    void launch(const std::string& name, Stream& stream) {
-        get(name).launch(stream);
-    }
+    void launch(const std::string& name, Stream& stream);
 
     // Overload nuevo: lanza el grafo `name` en SU PROPIO Stream dedicado
     // (creado lazy via stream_for). Asi "G_forward" y "telemetry" pueden
     // correr en paralelo sin que el caller gestione streams a mano.
-    void launch(const std::string& name) {
-        launch(name, stream_for(name));
-    }
+    void launch(const std::string& name);
 
     // Encapsula el patron begin_capture/fn()/end_capture usando el
     // stream dedicado de `name` (via stream_for). `fn` debe encolar
@@ -82,35 +57,13 @@ public:
     //   });
     //   ...
     //   manager.launch("G_forward"); // reusa el mismo stream dedicado
-    Graph& capture(const std::string& name, bool strict, const std::function<void()>& fn) {
-        Graph& g = get_or_create(name);
-        Stream& s = stream_for(name);
-        g.begin_capture(s, pool_, strict);
-        try {
-            fn();
-            g.end_capture(s);
-        } catch (...) {
-            // fn() (o algo dentro, como una allocation prohibida durante
-            // captura) lanzo antes de llegar a end_capture(). Sin este
-            // catch, el Graph queda atorado en capturing_=true para
-            // siempre y el Stream queda en estado de captura activa del
-            // lado del driver -- exactamente el bug que abort_capture()
-            // fue diseñado para resolver, reintroducido aqui si no se usa.
-            g.abort_capture(s);
-            throw; // preserva la excepcion original para el caller
-        }
-        return g;
-    }
+    Graph& capture(const std::string& name, bool strict, const std::function<void()>& fn);
 
     // Bloquea hasta que todos los streams dedicados (los creados via
     // stream_for/launch(name)/capture(name,...)) terminen. NO toca
     // streams externos que el caller haya pasado a launch(name, stream)
     // manualmente.
-    void synchronize_all() {
-        for (auto& [name, stream] : owned_streams_) {
-            stream->synchronize();
-        }
-    }
+    void synchronize_all();
 
     size_t count() const { return graphs_.size(); }
     size_t stream_count() const { return owned_streams_.size(); }

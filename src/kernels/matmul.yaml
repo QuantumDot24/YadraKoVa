@@ -1,0 +1,40 @@
+# src/kernels/matmul.yaml
+# Regla de dispatch para matmul_kernel (src/kernels/matmul.cu).
+# El nombre de archivo (sin extension) debe coincidir con el .cu hermano.
+
+kernel: matmul
+
+# Tamano de bloque fijo (compile-time). [x, y, z] -- z opcional, default 1.
+block: [16, 16, 1]
+
+# Helper "tile2d(filas, columnas)": azucar sintactico para el caso
+# mas comun (un thread por elemento de una matriz 2D de salida).
+#   grid.y = ceil(filas / block.y)
+#   grid.x = ceil(columnas / block.x)
+#   grid.z = 1
+# filas/columnas deben ser nombres definidos en args (M, N o K).
+grid: tile2d(M, N)
+
+# Memoria compartida dinamica en bytes (opcional, default 0).
+shared_mem_bytes: 0
+
+# Orden EXACTO de los argumentos del kernel, tal como aparecen en la
+# firma de matmul_kernel(...). Este orden es el que usara el Executor
+# para armar el arreglo de void* -- una sola lista, no tres separadas,
+# para que no haya ambiguedad de orden entre inputs/outputs/scalars.
+args:
+  - name: A
+    kind: in
+  - name: B
+    kind: in
+  - name: C
+    kind: out
+  - name: M
+    kind: scalar
+    dtype: int64
+  - name: N
+    kind: scalar
+    dtype: int64
+  - name: K
+    kind: scalar
+    dtype: int64

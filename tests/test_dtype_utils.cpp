@@ -1,4 +1,4 @@
-#include "core/dtype_utils.h"
+#include "core/dtype_utils.hpp"
 #include <cassert>
 #include <cmath>
 #include <iostream>

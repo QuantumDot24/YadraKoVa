@@ -1,5 +1,5 @@
-#include "core/memory.h"
-#include "core/cuda_error.h"
+#include "core/memory.hpp"
+#include "core/cuda_error.hpp"
 #include <map>
 #include <vector>
 #include <mutex>

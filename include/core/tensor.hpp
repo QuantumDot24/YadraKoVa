@@ -1,15 +1,17 @@
 #pragma once
-#include "core/memory.h"
-#include "core/host_buffer.h"
-#include "core/cuda_error.h"
-#include "core/stream.h"
+#include "core/memory.hpp"
+#include "core/host_buffer.hpp"
+#include "core/cuda_error.hpp"
+#include "core/stream.hpp"
+#include "core/executor.hpp"
 #include <vector>
 #include <numeric>
 #include <cassert>
 #include <stdexcept>
 #include <cuda_runtime.h>
+#include <random>
 
-#include "dtype_utils.h"
+#include "dtype_utils.hpp"
 
 namespace yadrakova::core
 {
@@ -43,6 +45,66 @@ namespace yadrakova::core
               , offset_(offset)
         {
             data_ptr_ = static_cast<T*>(buffer_->ptr) + offset_;
+        }
+
+        // Como torch.tensor([[1,2],[3,4]]) -- para tus sistemas del libro de
+        // algebra lineal. Infiera shape {rows, cols} de la lista anidada;
+        // lanza si las filas no tienen el mismo ancho (matriz mal formada).
+        static Tensor<T> from_nested(std::initializer_list<std::initializer_list<T>> rows,
+                                     MemoryPool& pool = default_pool())
+        {
+            int64_t n_rows = static_cast<int64_t>(rows.size());
+            if (n_rows == 0) throw std::runtime_error("from_nested: lista vacia");
+
+            int64_t n_cols = static_cast<int64_t>(rows.begin()->size());
+            std::vector<T> flat;
+            flat.reserve(n_rows * n_cols);
+            for (const auto& row : rows)
+            {
+                if (static_cast<int64_t>(row.size()) != n_cols)
+                    throw std::runtime_error("from_nested: todas las filas deben tener el mismo numero de columnas");
+                for (const T& v : row) flat.push_back(v);
+            }
+
+            Tensor<T> t({n_rows, n_cols}, pool);
+            t.to_device(flat.data(), flat.size());
+            return t;
+        }
+
+        // Vector plano -> Tensor con el shape que quieras. El caso general
+        // detras de from_nested, util cuando ya traes datos en std::vector.
+        static Tensor<T> from_vector(const std::vector<T>& data, Shape shape,
+                                     MemoryPool& pool = default_pool())
+        {
+            Tensor<T> t(std::move(shape), pool);
+            t.to_device(data.data(), data.size());
+            return t;
+        }
+
+        // Como torch.randn(shape) -- llena en CPU con normal(0,1) y sube a
+        // device. seed fijo por default para tests reproducibles (cambia esto
+        // si quieres aleatoriedad real entre corridas).
+        static Tensor<T> randn(Shape shape, unsigned seed = 42, MemoryPool& pool = default_pool())
+        {
+            Tensor<T> t(shape, pool);
+            int64_t n = t.numel();
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 1.0f);
+            std::vector<T> host(n);
+            for (auto& v : host) v = static_cast<T>(dist(rng));
+
+            t.to_device(host.data(), host.size());
+            return t;
+        }
+
+        // Baja el tensor completo a un std::vector<T> en host -- el reverso
+        // de from_vector/from_nested. Requiere contiguo, igual que to_host.
+        std::vector<T> to_vector() const
+        {
+            std::vector<T> host(static_cast<size_t>(numel()));
+            to_host(host.data(), host.size());
+            return host;
         }
 
         T* data() { return data_ptr_; }
@@ -107,6 +169,63 @@ namespace yadrakova::core
             return Tensor(buffer_, std::move(new_shape), contiguous_strides(new_shape), offset_);
         }
 
+        // --- algebra: dispatch autogenerado via Executor ---
+        //
+        // Solo 2D por ahora (el kernel naive no soporta batching).
+        // Asincrona respecto al host -- C queda listo logicamente pero
+        // el computo puede seguir en vuelo en `stream` hasta el
+        // siguiente synchronize().
+        Tensor matmul(const Tensor<T>& B, Stream& stream) const
+        {
+            if (ndim() != 2 || B.ndim() != 2)
+            {
+                throw std::runtime_error(
+                    "matmul: solo se soportan tensores 2D (A.ndim()=" +
+                    std::to_string(ndim()) + ", B.ndim()=" + std::to_string(B.ndim()) + ")");
+            }
+            if (shape_[1] != B.shape_[0])
+            {
+                throw std::runtime_error(
+                    "matmul: shapes incompatibles (" + std::to_string(shape_[0]) + "x" +
+                    std::to_string(shape_[1]) + ") @ (" + std::to_string(B.shape_[0]) + "x" +
+                    std::to_string(B.shape_[1]) + ")");
+            }
+            if (!is_contiguous() || !B.is_contiguous())
+            {
+                throw std::runtime_error(
+                    "matmul: ambos operandos deben ser contiguos (materializa una copia "
+                    "si vienen de transpose/permute/slice)");
+            }
+
+            const int64_t M = shape_[0];
+            const int64_t K = shape_[1];
+            const int64_t N = B.shape_[1];
+
+            Tensor<T> C({M, N});
+
+            // Punteros LOCALES: cuLaunchKernel espera un arreglo de
+            // void*, cada uno apuntando a DONDE VIVE el valor real del
+            // argumento -- no al valor en si. Para un argumento puntero
+            // (A, B, C) eso significa "puntero a la variable que
+            // contiene el puntero de device", no el puntero de device
+            // directamente. Estas variables deben seguir vivas hasta
+            // que cuLaunchKernel retorne (dentro de Executor::execute,
+            // llamado de forma sincrona mas abajo) -- no hace falta que
+            // sobrevivan a la ejecucion async del kernel en si.
+            const T* a_ptr = this->data_ptr_;
+            const T* b_ptr = B.data_ptr_;
+            T* c_ptr = C.data_ptr_;
+
+            // Orden EXACTO de matmul_kernel(A, B, C, M, N, K) -- debe
+            // coincidir con el orden declarado en matmul.yaml (args:).
+            std::vector<void*> args = {
+                &a_ptr, &b_ptr, &c_ptr, (void*)&M, (void*)&N, (void*)&K
+            };
+
+            Executor::execute<T>("matmul", M, N, K, args, stream);
+            return C;
+        }
+
         // --- transferencias host <-> device ---
         //
         // Requieren contiguidad: un memcpy plano no respeta strides no-contiguos.
@@ -146,7 +265,7 @@ namespace yadrakova::core
             if (host_buf.size() != static_cast<size_t>(numel()))
                 throw std::runtime_error("to_device_async: size mismatch");
             CUDA_CHECK(cudaMemcpyAsync(data_ptr_, host_buf.data(), host_buf.bytes(),
-                cudaMemcpyHostToDevice, stream.raw())); // antes: stream.handle()
+                cudaMemcpyHostToDevice, stream.raw()));
         }
 
         void to_host_async(HostBuffer<T>& host_buf, Stream& stream) const
@@ -155,7 +274,7 @@ namespace yadrakova::core
             if (host_buf.size() != static_cast<size_t>(numel()))
                 throw std::runtime_error("to_host_async: size mismatch");
             CUDA_CHECK(cudaMemcpyAsync(host_buf.data(), data_ptr_, host_buf.bytes(),
-                cudaMemcpyDeviceToHost, stream.raw())); // antes: stream.handle()
+                cudaMemcpyDeviceToHost, stream.raw()));
         }
 
     private:

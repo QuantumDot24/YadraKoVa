@@ -1,6 +1,6 @@
-#include "core/host_buffer.h"
-#include "core/tensor.h"
-#include "core/stream.h"
+#include "core/host_buffer.hpp"
+#include "core/tensor.hpp"
+#include "core/stream.hpp"
 #include <cassert>
 #include <iostream>
 #include <vector>

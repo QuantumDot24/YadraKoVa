@@ -1,10 +1,11 @@
 #pragma once
-#include "core/tensor.h"
+
 #include <cuda.h>
 #include <string>
 #include <unordered_map>
 #include <stdexcept>
 #include <mutex>
+#include "core/dtype_utils.hpp"
 
 namespace yadrakova::kernels
 {

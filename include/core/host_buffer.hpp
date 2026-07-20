@@ -1,5 +1,5 @@
 #pragma once
-#include "core/cuda_error.h"
+#include "core/cuda_error.hpp"
 
 namespace yadrakova::core {
 

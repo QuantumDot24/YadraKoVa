@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YadraKoVa kernel compiler + embedder.
+YadraKoVa kernel compiler + embedder + dispatch codegen.
 
 Escanea src/kernels/*.cu, compila cada uno a .cubin (SASS nativo, cero
 overhead de carga -- sin JIT) para cada combinacion arch x dtype
@@ -13,12 +13,22 @@ cambio), se borra automaticamente cualquier .cubin viejo de esa misma
 combinacion antes de compilar el nuevo -- pensado para iteracion
 constante de tuning de performance sin acumular basura para siempre.
 
-Genera DOS archivos por kernel, separando datos de efectos secundarios:
+Genera TRES archivos por kernel, separando datos de efectos secundarios:
   - include/kernels/embedded/{kernel}_embedded.cuh
         Solo datos (arrays de bytes). Header puro, sin side effects.
   - generated/kernels/{kernel}_registration.cpp
-        Solo el efecto secundario: registro estatico en KernelRegistry.
-        Vive FUERA de include/, en el build dir, generado y descartable.
+        Efecto secundario: registro estatico en KernelRegistry
+        (nombre -> CUfunction). Vive FUERA de include/, en el build
+        dir, generado y descartable.
+  - generated/kernels/{kernel}_dispatch.generated.cpp   [NUEVO]
+        Efecto secundario: registro estatico en DispatchRegistry
+        (nombre -> regla de calculo de grid/block), derivado de
+        src/kernels/{kernel}.yaml. Si el .yaml no existe, se omite
+        con un aviso -- permite migrar kernels uno por uno.
+
+El .yaml de dispatch vive junto al .cu (mismo stem, misma carpeta) y
+NO participa del hash de cache de compilacion de cubins: cambiar solo
+la regla de dispatch no deberia forzar una recompilacion de CUDA.
 """
 import argparse
 import hashlib
@@ -215,6 +225,140 @@ def write_registration_cpp(kernel_name: str, archs: list, dtypes: list,
     registration_cpp_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# --------------------------------------------------------------------------
+# NUEVO: codegen de dispatch (grid/block) a partir de src/kernels/{k}.yaml
+# --------------------------------------------------------------------------
+
+def _ceildiv_expr(numer: str, denom: int) -> str:
+    """ceil(numer/denom) en aritmetica entera, sin floats. numer es un
+    nombre de variable (M, N o K) que existe como parametro int64_t de
+    la funcion de dispatch generada; denom es un literal (block size),
+    conocido en tiempo de generacion."""
+    return f"(({numer} + {denom} - 1) / {denom})"
+
+
+# Cada helper declara a que dimensiones de grid (x/y/z) mapea cada uno
+# de sus argumentos posicionales. tile2d(filas, columnas) es el caso
+# comun de "un thread por elemento de una matriz 2D de salida".
+GRID_HELPERS = {
+    "tile2d": ("y", "x"),
+    "rows": ("y",),
+    "cols": ("x",),
+    "elementwise": ("x",),
+}
+
+
+def parse_grid_spec(grid_field, block: list) -> dict:
+    """Devuelve {'x': cpp_expr, 'y': cpp_expr, 'z': cpp_expr}, expresado
+    en terminos de M/N/K (los parametros de la funcion de dispatch) con
+    el block size ya resuelto como literal entero."""
+    dims = {"x": "1", "y": "1", "z": "1"}
+    block_by_dim = {"x": block[0], "y": block[1], "z": block[2] if len(block) > 2 else 1}
+
+    if isinstance(grid_field, str):
+        grid_field = grid_field.strip()
+        name, _, inner = grid_field.partition("(")
+        name = name.strip()
+        if name not in GRID_HELPERS or not inner.endswith(")"):
+            raise ValueError(
+                f"grid: '{grid_field}' no reconocido. Usa uno de "
+                f"{list(GRID_HELPERS)}(...) o la forma explicita {{x: .., y: ..}}"
+            )
+        arg_names = [a.strip() for a in inner[:-1].split(",") if a.strip()]
+        target_dims = GRID_HELPERS[name]
+        if len(arg_names) != len(target_dims):
+            raise ValueError(
+                f"grid: '{grid_field}' espera {len(target_dims)} argumento(s), "
+                f"recibio {len(arg_names)}"
+            )
+        for var_name, dim in zip(arg_names, target_dims):
+            if var_name not in ("M", "N", "K"):
+                raise ValueError(
+                    f"grid: '{var_name}' no es M, N ni K -- revisa {grid_field}"
+                )
+            dims[dim] = _ceildiv_expr(var_name, block_by_dim[dim])
+        return dims
+
+    if isinstance(grid_field, dict):
+        # Forma explicita, fallback para casos que no encajan en un
+        # helper: cada componente es una expresion C++ escrita a mano,
+        # libre de usar M, N, K.
+        for dim in ("x", "y", "z"):
+            if dim in grid_field:
+                dims[dim] = str(grid_field[dim])
+        return dims
+
+    raise ValueError(f"grid: tipo no soportado ({type(grid_field).__name__}); usa string o dict")
+
+
+def find_dispatch_yaml(source: Path) -> Path | None:
+    yaml_path = source.with_suffix(".yaml")
+    return yaml_path if yaml_path.exists() else None
+
+
+def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict,
+                       dispatch_cpp_path: Path, dispatch_registry_header: Path):
+    """Escribe el .cpp de registro de dispatch -- efecto secundario
+    analogo a write_registration_cpp, pero para DispatchRegistry en
+    vez de KernelRegistry."""
+    if kernel_yaml.get("kernel", kernel_name) != kernel_name:
+        print(f"  [WARN] 'kernel:' en el yaml no coincide con el nombre de archivo "
+              f"({kernel_yaml.get('kernel')!r} vs {kernel_name!r})", file=sys.stderr)
+
+    block = list(kernel_yaml.get("block", [1, 1, 1]))
+    while len(block) < 3:
+        block.append(1)
+    total_threads = block[0] * block[1] * block[2]
+    if total_threads > 1024:
+        raise ValueError(
+            f"'{kernel_name}.yaml': block {block} = {total_threads} threads/bloque, "
+            f"excede el maximo de 1024 de CUDA"
+        )
+
+    grid_field = kernel_yaml.get("grid")
+    if grid_field is None:
+        raise ValueError(f"'{kernel_name}.yaml' no define 'grid'")
+    grid = parse_grid_spec(grid_field, block)
+
+    shared_mem = int(kernel_yaml.get("shared_mem_bytes", 0))
+
+    registry_include = Path(os.path.relpath(dispatch_registry_header, dispatch_cpp_path.parent)).as_posix()
+    class_name = f"{kernel_name.capitalize()}DispatchRegistrar"
+    fn_name = f"compute_{kernel_name}_dispatch"
+
+    lines = [
+        "// AUTOGENERADO por scripts/compile_kernel.py -- NO EDITAR A MANO.",
+        f"// Regla de dispatch para '{kernel_name}', derivada de src/kernels/{kernel_name}.yaml",
+        f'#include "{registry_include}"',
+        "",
+        f"namespace yadrakova::kernels::dispatch_{kernel_name} {{",
+        "",
+        f"core::DispatchDims {fn_name}(int64_t M, int64_t N, int64_t K) {{",
+        "    core::DispatchDims dims;",
+        f"    dims.block = core::Dim3{{{block[0]}u, {block[1]}u, {block[2]}u}};",
+        "    dims.grid = core::Dim3{",
+        f"        static_cast<unsigned int>({grid['x']}),",
+        f"        static_cast<unsigned int>({grid['y']}),",
+        f"        static_cast<unsigned int>({grid['z']})",
+        "    };",
+        f"    dims.shared_mem_bytes = {shared_mem}u;",
+        "    return dims;",
+        "}",
+        "",
+        f"struct {class_name} {{",
+        f"    {class_name}() {{",
+        f'        core::DispatchRegistry::instance().register_dispatch("{kernel_name}", &{fn_name});',
+        "    }",
+        "};",
+        f"{class_name} instance;",
+        "",
+        "} // namespace",
+    ]
+
+    dispatch_cpp_path.parent.mkdir(parents=True, exist_ok=True)
+    dispatch_cpp_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
@@ -231,11 +375,14 @@ def main():
     src_dir = Path(config["kernels"]["source_dir"])
     cuh_out_dir = Path(config["kernels"]["output_dir"])
     cpp_out_dir = Path(args.output_dir) if args.output_dir else Path("generated/kernels")
-    registry_header = Path(config["kernels"].get("registry_header", "include/kernels/registry.h")).resolve()
+    registry_header = Path(config["kernels"].get("registry_header", "include/kernels/registry.hpp")).resolve()
+    dispatch_registry_header = Path(
+        config["kernels"].get("dispatch_registry_header", "include/core/dispatch_registry.hpp")
+    ).resolve()
     cache_dir = Path(config["cache"]["dir"])
 
     # Directorio de headers compartidos (common.cuh, etc.) -- mismo
-    # nivel que registry.h, usado tanto para -I de nvcc como para
+    # nivel que registry.hpp, usado tanto para -I de nvcc como para
     # el hash de invalidacion.
     shared_headers_dir = Path("include/kernels")
     include_dirs = [Path("include")]
@@ -272,6 +419,18 @@ def main():
 
         print(f"  -> {cuh_path}")
         print(f"  -> {cpp_path}")
+
+        # NUEVO: dispatch (grid/block), independiente del cache de cubins --
+        # cambiar solo el .yaml no deberia forzar una recompilacion CUDA.
+        yaml_path = find_dispatch_yaml(source)
+        if yaml_path is None:
+            print(f"  [dispatch] sin {kernel_name}.yaml -- se omite (kernel aun sin migrar)")
+        else:
+            with open(yaml_path, encoding="utf-8") as f:
+                kernel_yaml = yaml.safe_load(f)
+            dispatch_cpp_path = cpp_out_dir / f"{kernel_name}_dispatch.generated.cpp"
+            write_dispatch_cpp(kernel_name, kernel_yaml, dispatch_cpp_path, dispatch_registry_header)
+            print(f"  -> {dispatch_cpp_path}")
 
     # Prune final: kernels renombrados/eliminados desde la ultima corrida.
     valid_names = {s.stem for s in sources}

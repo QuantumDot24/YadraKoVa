@@ -1,6 +1,6 @@
-#include "core/graph.h"
-#include "core/graph_manager.h"
-#include "core/tensor.h"
+#include "core/graph.hpp"
+#include "core/graph_manager.hpp"
+#include "core/tensor.hpp"
 #include <cassert>
 #include <iostream>
 

@@ -1,6 +1,6 @@
-#include "core/tensor.h"
-#include "core/stream.h"
-#include "kernels/registry.h"
+#include "core/tensor.hpp"
+#include "core/stream.hpp"
+#include "kernels/registry.hpp"
 #include "kernels/embedded/gelu_embedded.cuh"
 #include "kernels/embedded/softmax_embedded.cuh"
 #include <vector>

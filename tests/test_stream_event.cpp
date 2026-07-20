@@ -1,6 +1,6 @@
-#include "core/stream.h"
-#include "core/event.h"
-#include "core/tensor.h"
+#include "core/stream.hpp"
+#include "core/event.hpp"
+#include "core/tensor.hpp"
 #include <cassert>
 #include <iostream>
 

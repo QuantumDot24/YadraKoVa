@@ -1,4 +1,4 @@
-#include "core/tensor.h"
+#include "core/tensor.hpp"
 #include <cassert>
 #include <iostream>
 
