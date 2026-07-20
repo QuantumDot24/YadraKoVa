@@ -86,8 +86,19 @@ public:
         Graph& g = get_or_create(name);
         Stream& s = stream_for(name);
         g.begin_capture(s, pool_, strict);
-        fn();
-        g.end_capture(s);
+        try {
+            fn();
+            g.end_capture(s);
+        } catch (...) {
+            // fn() (o algo dentro, como una allocation prohibida durante
+            // captura) lanzo antes de llegar a end_capture(). Sin este
+            // catch, el Graph queda atorado en capturing_=true para
+            // siempre y el Stream queda en estado de captura activa del
+            // lado del driver -- exactamente el bug que abort_capture()
+            // fue diseñado para resolver, reintroducido aqui si no se usa.
+            g.abort_capture(s);
+            throw; // preserva la excepcion original para el caller
+        }
         return g;
     }
 

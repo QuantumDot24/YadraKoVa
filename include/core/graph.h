@@ -78,12 +78,11 @@ public:
     // re-instanciar desde cero, que es mas costoso.
     void update_from(Graph& new_topology) {
         cudaGraphExecUpdateResultInfo result_info{};
-        cudaError_t err = cudaGraphExecUpdate(graph_exec_, new_topology.graph_, &result_info);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                "Graph '" + name_ + "': cudaGraphExecUpdate fallo (topologia probablemente cambio, "
-                "se requiere re-captura completa): " + cudaGetErrorString(err));
-        }
+        CUDA_CHECK_CTX(
+            cudaGraphExecUpdate(graph_exec_, new_topology.graph_, &result_info),
+            "Graph '" + name_ + "': cudaGraphExecUpdate fallo (topologia probablemente cambio, "
+            "se requiere re-captura completa)"
+        );
     }
     // Aborta una captura en progreso que fallo por una operacion prohibida
     // (ej: cudaMalloc durante captura). A diferencia de end_capture(), no

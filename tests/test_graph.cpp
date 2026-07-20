@@ -24,6 +24,38 @@ void test_basic_capture_and_launch() {
 
     std::cout << "[OK] basic_capture_and_launch\n";
 }
+void test_graph_manager_capture_cleans_up_on_exception() {
+    GraphManager manager;
+
+    bool threw = false;
+    try {
+        manager.capture("bad_capture", /*strict=*/true, [&]() {
+            // Fuerza un cudaMalloc durante captura -- debe lanzar.
+            Tensor<float> t({256, 256}, manager.pool());
+        });
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+
+    // El Graph debe poder reintentarse limpio despues del abort --
+    // si abort_capture() no se hubiera llamado, este segundo intento
+    // fallaria con "ya hay una captura en progreso".
+    Tensor<float> t_pre({256, 256}, manager.pool()); // preasignada correctamente
+
+    bool second_attempt_ok = true;
+    try {
+        manager.capture("bad_capture", true, [&]() {
+            cudaMemsetAsync(t_pre.data(), 0, t_pre.numel() * sizeof(float),
+                             manager.stream_for("bad_capture").raw());
+        });
+    } catch (...) {
+        second_attempt_ok = false;
+    }
+    assert(second_attempt_ok);
+
+    std::cout << "[OK] graph_manager_capture_cleans_up_on_exception\n";
+}
 void test_strict_mode_catches_allocation_during_capture() {
     Stream stream;
     MemoryPool pool(0);
@@ -92,6 +124,7 @@ int main() {
     test_basic_capture_and_launch();
     test_strict_mode_catches_allocation_during_capture();
     test_graph_manager_multiple_named_graphs();
+    test_graph_manager_capture_cleans_up_on_exception();
     std::cout << "Todos los tests de graph pasaron.\n";
     return 0;
 }
