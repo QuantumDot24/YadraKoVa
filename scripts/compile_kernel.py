@@ -459,6 +459,28 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
     dispatch_cpp_path.parent.mkdir(parents=True, exist_ok=True)
     dispatch_cpp_path.write_text("\n".join(lines), encoding="utf-8")
 
+import re
+
+def extract_kernel_name(cubin_stem: str, known_dtypes: set) -> str:
+    # Buscar el patrón "_{dtype}_" y tomar todo lo anterior como kernel_name
+    for dtype in known_dtypes:
+        marker = f"_{dtype}_"
+        if marker in cubin_stem:
+            return cubin_stem[:cubin_stem.index(marker)]
+    # fallback: split por "_" y confiar en que no haya dtype en el nombre (poco fiable)
+    return cubin_stem.split("_")[0]
+
+def prune_orphaned_kernels(cache_dir: Path, valid_kernel_names: set, known_dtypes: set):
+    if not cache_dir.exists():
+        return
+    removed = 0
+    for cubin in cache_dir.glob("*.cubin"):
+        kernel_name = extract_kernel_name(cubin.stem, known_dtypes)
+        if kernel_name not in valid_kernel_names:
+            cubin.unlink()
+            removed += 1
+    if removed:
+        print(f"[cache] {removed} .cubin huerfanos eliminados (kernel ya no existe)")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -504,10 +526,21 @@ def main():
     for source in sources:
         kernel_name = source.stem
         print(f"[kernel] {kernel_name}")
+
+        yaml_path = find_dispatch_yaml(source)
+        kernel_yaml = None
+        if yaml_path is not None:
+            with open(yaml_path, encoding="utf-8") as f:
+                kernel_yaml = yaml.safe_load(f)
+
+        kernel_dtypes = kernel_yaml.get("dtypes", dtypes) if kernel_yaml else dtypes
+        if kernel_dtypes != dtypes:
+            print(f"  [dtypes override] {kernel_name}: {kernel_dtypes} ...")
+
         cubins = {}
         for arch in archs:
             extra_flags = config["cuda"]["arch_flags"].get(arch, {}).get("extra_flags", [])
-            for dtype in dtypes:
+            for dtype in kernel_dtypes:
                 cubins[(arch, dtype)] = compile_one(
                     source, dtype, arch, cache_dir, extra_flags, nvcc_ver,
                     shared_headers_hash, include_dirs)
@@ -515,20 +548,15 @@ def main():
         cuh_path = cuh_out_dir / f"{kernel_name}_embedded.cuh"
         cpp_path = cpp_out_dir / f"{kernel_name}_registration.cpp"
 
-        write_cuh(kernel_name, archs, dtypes, cubins, cuh_path)
-        write_registration_cpp(kernel_name, archs, dtypes, cuh_path, cpp_path, registry_header)
+        write_cuh(kernel_name, archs, kernel_dtypes, cubins, cuh_path)
+        write_registration_cpp(kernel_name, archs, kernel_dtypes, cuh_path, cpp_path, registry_header)
 
         print(f"  -> {cuh_path}")
         print(f"  -> {cpp_path}")
 
-        # NUEVO: dispatch (grid/block), independiente del cache de cubins --
-        # cambiar solo el .yaml no deberia forzar una recompilacion CUDA.
-        yaml_path = find_dispatch_yaml(source)
-        if yaml_path is None:
-            print(f"  [dispatch] sin {kernel_name}.yaml -- se omite (kernel aun sin migrar)")
+        if kernel_yaml is None:
+            print(f"  [dispatch] sin {kernel_name}.yaml -- se omite ...")
         else:
-            with open(yaml_path, encoding="utf-8") as f:
-                kernel_yaml = yaml.safe_load(f)
             source_text = source.read_text(encoding="utf-8")
             dispatch_cpp_path = cpp_out_dir / f"{kernel_name}_dispatch.generated.cpp"
             write_dispatch_cpp(kernel_name, kernel_yaml, source_text, dispatch_cpp_path, dispatch_registry_header)
@@ -536,7 +564,7 @@ def main():
 
     # Prune final: kernels renombrados/eliminados desde la ultima corrida.
     valid_names = {s.stem for s in sources}
-    prune_orphaned_kernels(cache_dir, valid_names)
+    prune_orphaned_kernels(cache_dir, valid_names, set(dtypes))  # dtypes es la lista de config
 
 
 if __name__ == "__main__":

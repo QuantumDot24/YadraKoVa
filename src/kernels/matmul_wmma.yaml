@@ -1,0 +1,25 @@
+# matmul_wmma.yaml -- agregar esta línea
+kernel: matmul_wmma
+dtypes: [bf16, fp16]   
+block: [512, 1, 1]
+dims: [M, N, K]
+grid:
+  x: "((N + 63) / 64)"
+  y: "((M + 63) / 64)"
+shared_mem_bytes: 0
+args:
+  - name: A
+    kind: in
+  - name: B
+    kind: in
+  - name: C
+    kind: out
+  - name: M
+    kind: scalar
+    dtype: int64
+  - name: N
+    kind: scalar
+    dtype: int64
+  - name: K
+    kind: scalar
+    dtype: int64

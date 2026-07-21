@@ -15,7 +15,7 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES 86)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 # ---------------------------------------------------------------------------
 # Auto-descubrimiento de fuentes e includes (todo lo que NO es autogenerado)
 # ---------------------------------------------------------------------------
@@ -133,7 +133,8 @@ foreach(test_src ${YADRAKOVA_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
     target_link_libraries(${test_name} PRIVATE yadrakova_core)
-
+    # NUEVO: cuBLAS para tests de matmul que usen cublas_gemm_bf16
+    target_link_libraries(${test_name} PRIVATE CUDA::cublas)
     if(MSVC)
         target_link_options(${test_name} PRIVATE "/WHOLEARCHIVE:yadrakova_core")
     else()

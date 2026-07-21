@@ -20,7 +20,7 @@ namespace yadrakova::core
 
     Strides contiguous_strides(const Shape& shape);
 
-    template <typename T>
+    template <typename T = __nv_bfloat16>
     class Tensor
     {
     public:
@@ -269,7 +269,9 @@ namespace yadrakova::core
                 &a_ptr, &b_ptr, &c_ptr, (void*)&M, (void*)&N, (void*)&K
             };
 
-            Executor::execute<T>("matmul", DimMap{{"M", M}, {"N", N}, {"K", K}}, args, stream);
+            const char* kernel_name = "matmul_wmma";
+
+            Executor::execute<T>(kernel_name, DimMap{{"M", M}, {"N", N}, {"K", K}}, args, stream);
             return C;
         }
 
