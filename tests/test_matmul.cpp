@@ -10,7 +10,7 @@
 using namespace yadrakova::core;
 
 // ---------------------------------------------------------------------------
-// CuBLAS helper (C = A * B, todo en bf16)
+// CuBLAS helper (C = A * B,  bf16)
 // ---------------------------------------------------------------------------
 void cublas_gemm_bf16(const Tensor<__nv_bfloat16>& A,
                       const Tensor<__nv_bfloat16>& B,

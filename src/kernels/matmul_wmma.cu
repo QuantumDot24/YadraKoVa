@@ -1,4 +1,3 @@
-// src/kernels/matmul_wmma.cu
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -9,82 +8,147 @@
 #define KERNEL_DTYPE __nv_bfloat16
 #endif
 
-struct __nv_bfloat16;
 using namespace nvcuda;
 using namespace yadrakova::kernels::common;
 
-// Tiles pensados para caber en 512 threads/block (16 warps), bien
-// dentro del limite de 1024. TILE_K == WMMA_K: un solo mma_sync por
-// iteracion del loop de K -- mas simple de razonar que un doble loop;
-// eso es la siguiente optimizacion, no la de hoy.
-constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
-constexpr int TILE_M = 64, TILE_N = 64, TILE_K = WMMA_K;
-constexpr int WARPS_M = TILE_M / WMMA_M; // 4
-constexpr int WARPS_N = TILE_N / WMMA_N; // 4
-constexpr int THREADS_PER_BLOCK = WARPS_M * WARPS_N * 32; // 512
+// Configuración WMMA (Ampere / SM 8.6)
+constexpr int WMMA_M = 16;
+constexpr int WMMA_N = 16;
+constexpr int WMMA_K = 16;
 
-// bf16/fp16 con tensor cores. Solo se instancia (y solo se compila
-// codigo real) cuando KERNEL_DTYPE es uno de estos dos tipos -- el
-// build system ya compila un .cubin separado por dtype, asi que el
-// resto del template ni siquiera se genera para float/int8.
-//hola
+// Block Tiling
+constexpr int TILE_M = 64;
+constexpr int TILE_N = 64;
+constexpr int TILE_K = 32;
+
+// 128 hilos = 4 warps
+constexpr int WARPS_M = 2;
+constexpr int WARPS_N = 2;
+constexpr int THREADS_PER_BLOCK = WARPS_M * WARPS_N * 32; // 128
+
+// Padding para eliminar Bank Conflicts en Shared Memory
+constexpr int SHMEM_PAD = 8;
+constexpr int AS_STRIDE = TILE_K + SHMEM_PAD; // 40
+constexpr int BS_STRIDE = TILE_N + SHMEM_PAD; // 72
+
 template <typename HalfT>
-__device__ __forceinline__ void wmma_matmul_tile(
-    const HalfT* A, const HalfT* B, HalfT* C, int64_t M, int64_t N, int64_t K)
+__device__ __forceinline__ void wmma_matmul_tile_safe(
+    const HalfT* __restrict__ A,
+    const HalfT* __restrict__ B,
+    HalfT* __restrict__ C,
+    int64_t M, int64_t N, int64_t K)
 {
-    __shared__ HalfT As[TILE_M][TILE_K];
-    __shared__ HalfT Bs[TILE_K][TILE_N];
-    __shared__ float Cs[TILE_M][TILE_N];
+    __shared__ alignas(16) HalfT As[TILE_M][AS_STRIDE];
+    __shared__ alignas(16) HalfT Bs[TILE_K][BS_STRIDE];
+    __shared__ alignas(16) float Cs[TILE_M][BS_STRIDE];
 
-    const int tid = threadIdx.x; // block 1D de THREADS_PER_BLOCK
+    const int tid = threadIdx.x;
     const int warp_id = tid / 32;
-    const int warp_row = (warp_id / WARPS_N) * WMMA_M;
-    const int warp_col = (warp_id % WARPS_N) * WMMA_N;
 
-    const int64_t tile_row0 = blockIdx.y * TILE_M;
-    const int64_t tile_col0 = blockIdx.x * TILE_N;
+    const int warp_m = warp_id / WARPS_N;
+    const int warp_n = warp_id % WARPS_N;
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, HalfT, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, HalfT, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-    wmma::fill_fragment(c_frag, 0.0f);
+    const int64_t block_row = blockIdx.y * TILE_M;
+    const int64_t block_col = blockIdx.x * TILE_N;
+
+    constexpr int WARP_M_TILES = (TILE_M / WARPS_M) / WMMA_M; // 2
+    constexpr int WARP_N_TILES = (TILE_N / WARPS_N) / WMMA_N; // 2
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[WARP_M_TILES][WARP_N_TILES];
+
+    #pragma unroll
+    for (int i = 0; i < WARP_M_TILES; ++i) {
+        #pragma unroll
+        for (int j = 0; j < WARP_N_TILES; ++j) {
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+        }
+    }
 
     constexpr int A_ELEMS = TILE_M * TILE_K;
     constexpr int B_ELEMS = TILE_K * TILE_N;
 
+    // Loop principal sobre K
     for (int64_t k0 = 0; k0 < K; k0 += TILE_K) {
-        // Carga con stride: cada thread llena varios elementos si
-        // A_ELEMS/B_ELEMS > THREADS_PER_BLOCK (aqui 1024 > 512 -> 2 c/u).
+
+        // 1. Carga segura y coalescida de A -> Shared Memory
+        #pragma unroll
         for (int i = tid; i < A_ELEMS; i += THREADS_PER_BLOCK) {
-            int r = i / TILE_K, c = i % TILE_K;
-            int64_t gr = tile_row0 + r, gc = k0 + c;
+            int r = i / TILE_K;
+            int c = i % TILE_K;
+            int64_t gr = block_row + r;
+            int64_t gc = k0 + c;
+
             As[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : HalfT(0.0f);
         }
+
+        // 2. Carga segura y coalescida de B -> Shared Memory
+        #pragma unroll
         for (int i = tid; i < B_ELEMS; i += THREADS_PER_BLOCK) {
-            int r = i / TILE_N, c = i % TILE_N;
-            int64_t gr = k0 + r, gc = tile_col0 + c;
+            int r = i / TILE_N;
+            int c = i % TILE_N;
+            int64_t gr = k0 + r;
+            int64_t gc = block_col + c;
+
             Bs[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : HalfT(0.0f);
         }
+
         __syncthreads();
 
-        wmma::load_matrix_sync(a_frag, &As[warp_row][0], TILE_K);
-        wmma::load_matrix_sync(b_frag, &Bs[0][warp_col], TILE_N);
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        // 3. Multiplicación WMMA (2 pasos de K=16)
+        #pragma unroll
+        for (int k_step = 0; k_step < TILE_K; k_step += WMMA_K) {
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, HalfT, wmma::row_major> a_frag[WARP_M_TILES];
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, HalfT, wmma::row_major> b_frag[WARP_N_TILES];
+
+            #pragma unroll
+            for (int i = 0; i < WARP_M_TILES; ++i) {
+                int warp_row = warp_m * (WARP_M_TILES * WMMA_M) + i * WMMA_M;
+                wmma::load_matrix_sync(a_frag[i], &As[warp_row][k_step], AS_STRIDE);
+            }
+
+            #pragma unroll
+            for (int j = 0; j < WARP_N_TILES; ++j) {
+                int warp_col = warp_n * (WARP_N_TILES * WMMA_N) + j * WMMA_N;
+                wmma::load_matrix_sync(b_frag[j], &Bs[k_step][warp_col], BS_STRIDE);
+            }
+
+            #pragma unroll
+            for (int i = 0; i < WARP_M_TILES; ++i) {
+                #pragma unroll
+                for (int j = 0; j < WARP_N_TILES; ++j) {
+                    wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+                }
+            }
+        }
 
         __syncthreads();
     }
 
-    // WMMA siempre acumula en fp32 (hardware) -- store a shared como
-    // float, luego castea a T al escribir a global. Asi C queda en el
-    // mismo dtype que A/B, igual que gelu/softmax.
-    wmma::store_matrix_sync(&Cs[warp_row][warp_col], c_frag, TILE_N, wmma::mem_row_major);
+    // 4. Guardado en Shared Memory FP32
+    #pragma unroll
+    for (int i = 0; i < WARP_M_TILES; ++i) {
+        int warp_row = warp_m * (WARP_M_TILES * WMMA_M) + i * WMMA_M;
+        #pragma unroll
+        for (int j = 0; j < WARP_N_TILES; ++j) {
+            int warp_col = warp_n * (WARP_N_TILES * WMMA_N) + j * WMMA_N;
+            wmma::store_matrix_sync(&Cs[warp_row][warp_col], c_frag[i][j], BS_STRIDE, wmma::mem_row_major);
+        }
+    }
+
     __syncthreads();
 
+    // 5. Escritura final segura a Memoria Global C
     constexpr int C_ELEMS = TILE_M * TILE_N;
+    #pragma unroll
     for (int i = tid; i < C_ELEMS; i += THREADS_PER_BLOCK) {
-        int r = i / TILE_N, c = i % TILE_N;
-        int64_t gr = tile_row0 + r, gc = tile_col0 + c;
-        if (gr < M && gc < N) C[gr * N + gc] = from_float<HalfT>(Cs[r][c]);
+        int r = i / TILE_N;
+        int c = i % TILE_N;
+        int64_t gr = block_row + r;
+        int64_t gc = block_col + c;
+
+        if (gr < M && gc < N) {
+            C[gr * N + gc] = from_float<HalfT>(Cs[r][c]);
+        }
     }
 }
 
@@ -92,5 +156,5 @@ extern "C" __global__ void matmul_wmma_kernel(
     const KERNEL_DTYPE* A, const KERNEL_DTYPE* B, KERNEL_DTYPE* C,
     int64_t M, int64_t N, int64_t K)
 {
-    wmma_matmul_tile<KERNEL_DTYPE>(A, B, C, M, N, K);
+    wmma_matmul_tile_safe<KERNEL_DTYPE>(A, B, C, M, N, K);
 }
