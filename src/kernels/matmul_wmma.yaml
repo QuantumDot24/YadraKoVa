@@ -1,11 +1,10 @@
-# matmul_wmma.yaml
 kernel: matmul_wmma
 dtypes: [bf16, fp16]
-block: [128, 1, 1]   # <--- Cambiar 512 por 128
+block: [256, 1, 1]   # <--- Cambiar a 256
 dims: [M, N, K]
 grid:
   x: "((N + 63) / 64)"
-  y: "((M + 63) / 64)"
+  y: "((M + 127) / 128)" # <--- Dividir M entre 128
 shared_mem_bytes: 0
 args:
   - name: A
