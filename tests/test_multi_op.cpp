@@ -10,8 +10,8 @@
 
 using namespace yadrakova::core;
 
-// Reconstruye el resumen de consola a partir de los records ya resueltos
-// (duration_ms real, post resolve_pending()) en vez de time_kernel_ms.
+// Reconstruct the console summary from the already resolved records
+// (real duration_ms, post resolve_pending()) instead of time_kernel_ms.
 void print_telemetry_from_records(const std::string& label_filter,
                                    const std::vector<TelemetryRecord>& records,
                                    size_t expected_count)
@@ -19,9 +19,9 @@ void print_telemetry_from_records(const std::string& label_filter,
     std::vector<float> durations;
     durations.reserve(expected_count);
 
-    // Si label_filter es "toy_pipeline" (graph replay), cada record ya es
-    // un replay completo. Si es "" (sin capture), agrupamos matmul+gelu+softmax
-    // de 3 en 3 para reconstruir el total por iteracion.
+    // If label_filter is "toy_pipeline" (graph replay), each record is already
+    // a complete replay. If it is "" (no capture), we group matmul+gelu+softmax
+    // in groups of 3 to reconstruct the total per iteration.
     if (label_filter == "toy_pipeline")
     {
         for (const auto& r : records)
@@ -51,18 +51,18 @@ void print_telemetry_from_records(const std::string& label_filter,
 
     if (durations.empty())
     {
-        std::cout << "[" << label_filter << "] sin datos resueltos\n";
+        std::cout << "[" << label_filter << "] no resolved data\n";
         return;
     }
 
     float total = 0.0f;
     for (float d : durations) total += d;
 
-    std::cout << "[" << (label_filter.empty() ? "sin_capture" : label_filter) << "] "
+    std::cout << "[" << (label_filter.empty() ? "no_capture" : label_filter) << "] "
         << durations.size() << " replays, "
         << "avg " << (total / durations.size()) << " ms, "
-        << "primer replay " << durations.front() << " ms, "
-        << "ultimo replay " << durations.back() << " ms\n";
+        << "first replay " << durations.front() << " ms, "
+        << "last replay " << durations.back() << " ms\n";
 }
 
 void check_pipeline_replay_matches_direct(
@@ -97,7 +97,7 @@ void check_pipeline_replay_matches_direct(
     if (mismatches > 0)
     {
         std::cout << "[FAIL] " << mismatches << " / " << vec_graph.size()
-            << " fuera de tolerancia | max_abs=" << max_abs
+            << " out of tolerance | max_abs=" << max_abs
             << " max_rel=" << max_rel << "\n";
         assert(mismatches == 0);
     }
@@ -127,7 +127,7 @@ int main()
         Stream& stream = manager.stream_for("toy_pipeline");
         cudaStream_t raw_stream = stream.raw();
 
-        // Warmup / compilacion JIT previa
+        // Warmup / previous JIT compilation
         out_matmul = A.matmul(B, stream);
         out_gelu = out_matmul.gelu(stream);
         out_softmax = out_gelu.softmax(stream);
@@ -135,7 +135,7 @@ int main()
 
         manager.telemetry().start_session();
 
-        // --- Benchmark SIN graph capture (via TelemetryScope, sin sync en hot path) ---
+        // --- Benchmark WITHOUT graph capture (via TelemetryScope, no sync in hot path) ---
         for (int i = 0; i < kReplays; ++i)
         {
             {
@@ -152,7 +152,7 @@ int main()
             }
         }
 
-        // --- Captura ---
+        // --- Capture ---
         manager.capture("toy_pipeline", /*strict=*/true, [&]
         {
             out_matmul = A.matmul(B, stream);
@@ -161,14 +161,15 @@ int main()
         });
         assert(manager.get("toy_pipeline").is_instantiated());
 
-        // Warmup del grafo: el primer launch tras cudaGraphInstantiate paga
-        // el costo de "subir" la topologia al device (graph upload), algo
-        // que no se repite en replays subsecuentes. Igual que arriba con
-        // matmul/gelu/softmax, se descarta y no entra a la telemetria medida.
+        // Graph warmup: the first launch after cudaGraphInstantiate pays
+        // the cost of uploading the topology to the device (graph upload),
+        // something that does not repeat in subsequent replays. Just like
+        // above with matmul/gelu/softmax, it is discarded and not included
+        // in the measured telemetry.
         manager.launch("toy_pipeline");
         stream.synchronize();
 
-        // --- Benchmark CON graph replay (via TelemetryScope) ---
+        // --- Benchmark WITH graph replay (via TelemetryScope) ---
         for (int i = 0; i < kReplays; ++i)
         {
             TelemetryScope scope(&manager.telemetry(), "toy_pipeline", OpKind::GraphReplay,
@@ -176,15 +177,15 @@ int main()
             manager.launch("toy_pipeline");
         }
 
-        // Un solo punto de sincronizacion: resuelve TODOS los eventos pendientes
-        // (sin_capture + graph_replay) y los vuelca a records_.
+        // Single synchronization point: resolves ALL pending events
+        // (no_capture + graph_replay) and dumps them into records_.
         manager.telemetry().resolve_pending();
 
-        // Reconstruye los logs de consola a partir de los records ya resueltos.
+        // Reconstruct the console logs from the already resolved records.
         print_telemetry_from_records("", manager.telemetry().records(), kReplays);
         print_telemetry_from_records("toy_pipeline", manager.telemetry().records(), kReplays);
 
-        // --- Correctness: graph replay vs ejecucion directa ---
+        // --- Correctness: graph replay vs direct execution ---
         auto vec_graph = out_softmax.to_vector();
 
         Tensor<__nv_bfloat16> ref_matmul = A.matmul(B, stream);
@@ -197,12 +198,12 @@ int main()
 
         std::cout << "Toy pipeline test OK.\n";
 
-        // --- Telemetria: publicar a MQTT para la app Android ---
-        std::cout << "\n--- telemetry (publicando a MQTT) ---\n";
+        // --- Telemetry: publish to MQTT for the Android app ---
+        std::cout << "\n--- telemetry (publishing to MQTT) ---\n";
         TelemetryMqttPublisher publisher("tcp://localhost:1883", "yadrakova_benchmark");
         bool ok = publisher.publish_lines(manager.telemetry().export_all_as_json_lines(),
                                           "yadrakova/telemetry");
-        std::cout << (ok ? "Telemetria publicada OK.\n" : "Fallo publicando telemetria (broker caido?).\n");
+        std::cout << (ok ? "Telemetry published OK.\n" : "Failed publishing telemetry (broker down?).\n");
     }
     catch (const std::exception& e)
     {
