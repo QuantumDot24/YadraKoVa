@@ -1,5 +1,3 @@
-hardware_profile: rtx3060_laptop
-
 cuda:
   architectures: [sm_86]
   arch_flags:

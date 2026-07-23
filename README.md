@@ -1,31 +1,131 @@
-# Evaluación del nuevo sistema
-
 ![Diagrama de arquitectura](architecture.png)
 
-## Puntos fuertes concretos de hoy
+# Cómo agregar una nueva arquitectura de GPU a YadraKoVa
 
-- **Cierre del ciclo de auto-registro**  
-  Pasaste correctamente de "no hay kernel registrado" a un sistema con `WHOLEARCHIVE` + `OUTPUT` explícito, probado como determinista en build limpio y sucesivo (tres veces).
+Esta guía documenta el proceso completo para que YadraKoVa soporte una GPU con
+una `compute capability` que todavía no conoce (ej. pasar de una RTX 3060
+sm_86 a una RTX 5090 sm_120, o a un datacenter Blackwell sm_100).
 
-- **Corrección de precisión en test propio**  
-  Detectaste por ti mismo que un test escalar con π (`test_precision_bf16_vs_fp16_diverge`) podía coincidir por casualidad y lo corregiste usando una muestra estadística de 500 valores no alineados. Ese rigor evita falsos positivos silenciosos.
+## Antes de empezar: identifica el compute capability real
 
-- **Centralización de `CUDA_CHECK` / `CUDA_CHECK_CTX`**  
-  Resolviste el pendiente #4 y migraste consistentemente los chequeos a `Stream`, `Event` y `Graph` (con la única excepción de `update_from`, señalada como cosmética).
+No asumas por el nombre comercial de la tarjeta. Verifica el compute
+capability exacto en la [tabla oficial de NVIDIA](https://developer.nvidia.com/cuda-gpus).
 
-- **Generalización con `abort_capture()`**  
-  Convertiste un problema que viviste a mano en una utilidad reusable. El bug que encontramos en `GraphManager::capture()` demuestra su importancia: sin una propagación correcta de `abort_capture()`, un `Graph` puede quedar atorado permanentemente tras una excepción.
+Ejemplos de referencia (verificar siempre, esto puede cambiar con nuevos lanzamientos):
+- RTX 3060 → sm_86 (Ampere)
+- RTX 5090 → sm_120 (Blackwell consumer)
+- B100 / B200 (datacenter) → sm_100 (Blackwell datacenter)
 
-- **Filosofía de diseño consistente en guards**  
-  `check_contiguous_for_transfer` en `Tensor` comparte el mismo ADN que `Graph::end_capture()`. En todo el core corre el principio de nunca fallar en silencio, siempre explicar qué se rompió y por qué.
+Blackwell consumer y Blackwell datacenter **no comparten compute capability**,
+aunque compartan nombre de arquitectura. Trátalas como entradas separadas.
 
-## Áreas que vale la pena vigilar según crezcas
+## Cuándo necesitas seguir esta guía completa vs. cuándo no
 
-- **Doble implementación de conversión de dtype**  
-  `common.cuh::to_float<T>` vs `dtype_utils.h::bf16_to_f32` no es un bug, pero es deuda técnica consciente. Convendrá unificarlas en algún punto.
+- **Comprar una segunda GPU con la misma arch que ya soportas** (ej. ya tienes
+  una sm_86 y compras otra sm_86): no necesitas tocar nada. `Device` la
+  detecta sola en runtime.
+- **Comprar una GPU con compute capability nuevo**: sigue todos los pasos de
+  abajo.
 
-- **Costo de recompilación completa al tocar `common.cuh`**  
-  Hoy con 3 kernels es irrelevante, pero cuando tengas ~30-40 kernels sentirás que cada cambio a un header compartido tarda demasiado. Conviene revisar la estrategia de inclusión antes de llegar a ese punto.
+## Pasos
 
-- **`update_from()` en `Graph` sin migrar a `CUDA_CHECK_CTX`**  
-  Es un pendiente trivial y cosmético, fácil de resolver en cualquier momento.
+### 1. `include/kernels/registry.hpp` — agregar el valor al enum
+
+```cpp
+enum class Arch { SM_86, SM_100, SM_120 };  // agrega el nuevo valor
+```
+
+Este enum es el vocabulario compartido entre el codegen de build-time
+(`compile_kernel.py`) y la selección de kernel en runtime (`KernelRegistry`,
+`Device`). Vive aquí porque `KernelRegistry` es quien lo usa como parte de su
+clave de búsqueda.
+
+### 2. `src/core/device.cpp` — mapear compute capability → `Arch`
+
+En `Device::map_arch`, agrega el caso correspondiente:
+
+```cpp
+kernels::Arch Device::map_arch(int major, int minor) {
+    int cc = major * 10 + minor;
+    switch (cc) {
+        case 86:  return kernels::Arch::SM_86;
+        case 100: return kernels::Arch::SM_100;
+        case 120: return kernels::Arch::SM_120;  // <- nuevo
+        default:
+            throw std::runtime_error(/* ... */);
+    }
+}
+```
+
+`Device` detecta la GPU real en runtime vía `cudaGetDeviceProperties` y
+traduce major/minor a este enum. Si te saltas este paso, el programa truena
+al arrancar con un mensaje explicando exactamente qué falta (por diseño, no
+falla en silencio).
+
+### 3. `scripts/compile_kernel.py` — agregar a los diccionarios de mapeo
+
+```python
+ARCH_TO_SM = {"sm_86": "86", "sm_100": "100", "sm_120": "120"}
+ARCH_TO_ENUM = {"sm_86": "Arch::SM_86", "sm_100": "Arch::SM_100", "sm_120": "Arch::SM_120"}
+```
+
+Estos diccionarios traducen el string del `config.yaml` (`sm_120`) al flag
+real de `nvcc` (`-arch=sm_120`) y al literal C++ (`Arch::SM_120`) que se
+escribe en los `.cpp` de registro autogenerados.
+
+### 4. `config.yaml` — activar la arquitectura en el build
+
+```yaml
+cuda:
+  architectures: [sm_86, sm_120]
+  arch_flags:
+    sm_86:
+      extra_flags: []
+    sm_120:
+      extra_flags: []   # flags especificas de la arch, si aplica
+```
+
+Este es el único paso que "enciende" la compilación para la arch nueva. Los
+pasos 1-3 son vocabulario que se toca una sola vez por arquitectura nunca
+antes vista; este paso 4 es el que controla qué se compila en cada build.
+
+### 5. Recompilar
+
+```bash
+python scripts/compile_kernel.py
+```
+
+Esto regenera automáticamente los `_embedded.cuh` y `_registration.cpp` de
+**todos** los kernels existentes (`gelu`, `matmul_wmma`, etc.) para incluir
+también los cubins de la arch nueva. No hay que tocar el código fuente `.cu`
+de cada kernel individual para que compile en la arch nueva.
+
+### 6. Nada más
+
+`Device` detecta automáticamente en runtime qué GPU hay presente y pide a
+`KernelRegistry` el cubin correspondiente. `Executor` no necesita ningún
+cambio — nunca tuvo hardcodeada la arch, siempre le pregunta a `Device`.
+
+## Nota sobre aprovechar features nuevas de la arquitectura
+
+Compilar para una arch nueva (pasos 1-5) garantiza que el kernel **corre**
+correctamente ahí — `nvcc` traduce el código CUDA existente al ISA de la
+nueva arquitectura. Pero **no garantiza que estés aprovechando** hardware
+nuevo exclusivo de esa arch (ej. tipos de dato fp4/fp6 en Blackwell
+datacenter, cambios en cómo se invocan los fragments de Tensor Cores, nuevas
+instrucciones WGMMA/TMA, etc.).
+
+Aprovechar eso requiere escribir una variante del kernel específica para esa
+arch (ej. `matmul_wmma_sm120.cu` con su propio path de código), lo cual es
+trabajo de kernel-engineering, no de infraestructura. Cuando llegue ese
+momento, es un proyecto aparte de "hacer que compile en la arch nueva".
+
+## Checklist rápido
+
+- [ ] Confirmar compute capability real (major.minor) de la GPU nueva
+- [ ] `registry.hpp`: agregar valor al enum `Arch`
+- [ ] `device.cpp`: agregar case en `Device::map_arch`
+- [ ] `compile_kernel.py`: agregar entradas a `ARCH_TO_SM` y `ARCH_TO_ENUM`
+- [ ] `config.yaml`: agregar el string de arch a `cuda.architectures`
+- [ ] Correr `python scripts/compile_kernel.py`
+- [ ] Correr los tests existentes en la GPU nueva para confirmar

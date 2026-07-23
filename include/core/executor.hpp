@@ -7,24 +7,21 @@
 #include <cuda.h>
 #include <string>
 #include <vector>
+#include "device.hpp"
 
 namespace yadrakova::core {
 
     class Executor {
     public:
-        // dims: mapa nombrado (ej. {"M":64,"N":64,"K":64} o {"n":4096}),
-        // debe coincidir con los nombres declarados en `dims:` del yaml
-        // del kernel. args ya trae todos los punteros/escalares en el
-        // orden exacto de la firma real (ver args: del yaml).
         template <typename T>
-        static void execute(const std::string& kernel_name,
-                            const DimMap& dims,
-                            const std::vector<void*>& args,
-                            Stream& stream)
+  static void execute(const std::string& kernel_name,
+                      const DimMap& dims,
+                      const std::vector<void*>& args,
+                      Stream& stream)
         {
             DType dtype = dtype_traits<T>::value;
 
-            constexpr kernels::Arch current_arch = kernels::Arch::SM_86;
+            kernels::Arch current_arch = Device::instance().arch();
 
             CUfunction fn = kernels::KernelRegistry::instance().get_function(kernel_name, current_arch, dtype);
             DispatchDims d = DispatchRegistry::instance().get_dims(kernel_name, dims);

@@ -122,8 +122,6 @@ void benchmark_matmul_wmma(int M, int N, int K)
 
     Stream profile_stream;
 
-    // Warm-up (outside measurement: the first run may include
-    // initialization costs, JIT of cubins, etc.)
     A.matmul(B, profile_stream);
     profile_stream.synchronize();
 
