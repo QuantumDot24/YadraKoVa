@@ -31,7 +31,15 @@ namespace yadrakova::core {
                 client.publish(msg);
             }
 
-            client.disconnect();
+            // QoS 0 no tiene ack -- publish() no garantiza que el mensaje
+            // ya salio por el socket, solo que se encolo. Un disconnect()
+            // inmediato tras una rafaga puede cortar la cola de salida a
+            // la mitad y perder los ultimos mensajes en silencio (sin
+            // excepcion, porque QoS 0 no tiene nada que fallar). El
+            // quiesce timeout le da margen al cliente para vaciar esa
+            // cola antes de cerrar la conexion.
+            constexpr int kQuiesceTimeoutMs = 1000;
+            client.disconnect(kQuiesceTimeoutMs);
         } catch (const mqtt::exception& exc) {
             // No relanzamos: perder telemetria no deberia tumbar el
             // benchmark. El caller ya tiene las lineas en memoria si

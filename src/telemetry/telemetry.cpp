@@ -2,17 +2,18 @@
 #include "telemetry/telemetry.hpp"
 #include <sstream>
 #include <iomanip>
+#include <stdexcept>
 
 namespace yadrakova::core {
 
     const char* to_string(OpKind kind) {
         switch (kind) {
         case OpKind::Gemm:        return "gemm";
-        case OpKind::Gemv:        return "gemv";        // <---
+        case OpKind::Gemv:        return "gemv";
         case OpKind::Elementwise: return "elementwise";
         case OpKind::Reduction:   return "reduction";
-        case OpKind::Attention:   return "attention";   // <---
-        case OpKind::Conv2D:      return "conv2d";      // <---
+        case OpKind::Attention:   return "attention";
+        case OpKind::Conv2D:      return "conv2d";
         case OpKind::GraphReplay: return "graph_replay";
         case OpKind::Memcpy:      return "memcpy";
         case OpKind::Other:       return "other";
@@ -22,10 +23,7 @@ namespace yadrakova::core {
 
 Telemetry::Telemetry(size_t reserve_capacity) {
     records_.reserve(reserve_capacity);
-    // session_start_ se inicializa "vacio" hasta que se llame start_session();
-    // si alguien graba antes de arrancar sesion, los timestamps saldran
-    // relativos a este constructor, no es un error fatal pero conviene
-    // llamar start_session() explicitamente.
+    pending_.reserve(reserve_capacity);
     session_start_ = std::chrono::steady_clock::now();
 }
 
@@ -67,21 +65,96 @@ void Telemetry::record(std::string label, OpKind kind, float duration_ms,
     records_.push_back(std::move(r));
 }
 
+size_t Telemetry::begin_async(cudaStream_t stream) {
+    cudaEvent_t start;
+    cudaError_t err = cudaEventCreate(&start);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaEventCreate (start) fallo: ") +
+                                  cudaGetErrorString(err));
+    }
+    err = cudaEventRecord(start, stream);
+    if (err != cudaSuccess) {
+        cudaEventDestroy(start);
+        throw std::runtime_error(std::string("cudaEventRecord (start) fallo: ") +
+                                  cudaGetErrorString(err));
+    }
+
+    in_flight_.push_back(InFlightEvent{start, stream});
+    return in_flight_.size() - 1;
+}
+
+void Telemetry::end_async(size_t handle, std::string label, OpKind kind,
+                           const void* stream_id_hint, bool from_graph_replay,
+                           uint64_t bytes_moved, double gflops) {
+    // handle invalido (fuera de rango) -> no reventar en release, solo ignorar.
+    if (handle >= in_flight_.size()) {
+        return;
+    }
+    InFlightEvent in_flight = in_flight_[handle];
+
+    cudaEvent_t end;
+    cudaError_t err = cudaEventCreate(&end);
+    if (err != cudaSuccess) {
+        cudaEventDestroy(in_flight.start);
+        throw std::runtime_error(std::string("cudaEventCreate (end) fallo: ") +
+                                  cudaGetErrorString(err));
+    }
+    err = cudaEventRecord(end, in_flight.stream);
+    if (err != cudaSuccess) {
+        cudaEventDestroy(in_flight.start);
+        cudaEventDestroy(end);
+        throw std::runtime_error(std::string("cudaEventRecord (end) fallo: ") +
+                                  cudaGetErrorString(err));
+    }
+
+    pending_.push_back(PendingEvent{
+        in_flight.start, end, std::move(label), kind,
+        stream_id_hint, from_graph_replay, bytes_moved, gflops
+    });
+
+    // No compactamos in_flight_ (evitar invalidar handles activos concurrentes).
+    // Se limpia entero en resolve_pending().
+}
+
+void Telemetry::resolve_pending() {
+    for (auto& p : pending_) {
+        // cudaEventSynchronize espera a que 'end' se complete, lo cual
+        // implica que todo lo encolado antes en ese stream (incluyendo
+        // 'start') ya termino tambien. Un solo punto de sincronizacion
+        // por evento, no un barrier global de todos los streams.
+        cudaError_t err = cudaEventSynchronize(p.end);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(p.start);
+            cudaEventDestroy(p.end);
+            throw std::runtime_error(std::string("cudaEventSynchronize fallo: ") +
+                                      cudaGetErrorString(err));
+        }
+
+        float ms = 0.0f;
+        err = cudaEventElapsedTime(&ms, p.start, p.end);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(p.start);
+            cudaEventDestroy(p.end);
+            throw std::runtime_error(std::string("cudaEventElapsedTime fallo: ") +
+                                      cudaGetErrorString(err));
+        }
+
+        record(std::move(p.label), p.op_kind, ms, p.stream_hint,
+               p.from_graph_replay, p.bytes_moved, p.gflops);
+
+        cudaEventDestroy(p.start);
+        cudaEventDestroy(p.end);
+    }
+    pending_.clear();
+    in_flight_.clear();
+}
+
 void Telemetry::clear() {
     records_.clear();
-    // Nota: a proposito NO reseteamos next_sequence_ ni stream_id_map_ aqui.
-    // clear() es "borra lo capturado hasta ahora" (p.ej. tras exportar un
-    // lote a MQTT); start_session() es "empieza una sesion nueva de cero".
-    // Si los mezclas y esperas sequence_id reiniciado en 0 tras un clear(),
-    // ese es el motivo -- llama start_session() si quieres eso.
 }
 
 namespace {
 
-// Escapa lo minimo necesario para que un string quede valido dentro de
-// un JSON: comillas, backslash y saltos de linea. No es un escapador
-// JSON completo (no cubre unicode raro), pero para labels de kernels
-// ("matmul_wmma", etc.) es mas que suficiente.
 std::string json_escape(const std::string& in) {
     std::string out;
     out.reserve(in.size() + 8);
