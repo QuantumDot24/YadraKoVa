@@ -2,12 +2,13 @@
 #include "core/graph_manager.hpp"
 #include "core/event.hpp"
 #include "telemetry/telemetry.hpp"
+#include "telemetry/telemetry_mqtt_publisher.hpp"
 #include <iostream>
 #include <vector>
 #include <cassert>
 #include <cmath>
 
-#include "telemetry/telemetry_mqtt_publisher.hpp"
+#include "telemetry/telemetry_scope.hpp"
 
 using namespace yadrakova::core;
 
@@ -27,11 +28,6 @@ void print_telemetry(const std::string& label, const std::vector<ReplayTelemetry
         << "ultimo replay " << log.back().ms << " ms\n";
 }
 
-// Mismo criterio que matmul_test.cpp: diff <= atol + rtol * |ref|.
-// Aqui comparamos bf16 vs bf16 (graph replay vs ejecucion directa,
-// mismos inputs), asi que la tolerancia es la misma que usas para
-// validar tu kernel contra cuBLAS -- no la de gelu/softmax vs CPU
-// float, que es mas estricta y no aplica entre dos corridas bf16.
 void check_pipeline_replay_matches_direct(
     const std::vector<__nv_bfloat16>& vec_graph,
     const std::vector<__nv_bfloat16>& vec_ref,
@@ -81,7 +77,7 @@ int main()
         MemoryPool pool(0);
         GraphManager manager(pool);
 
-        const int64_t M = 512, K = 512, N = 16; // N<=32 por el kernel de softmax actual
+        const int64_t M = 512, K = 512, N = 16;
         constexpr int kReplays = 50;
 
         Tensor<__nv_bfloat16> A = Tensor<__nv_bfloat16>::randn({M, K}, 1, pool);
@@ -93,25 +89,40 @@ int main()
 
         Stream& stream = manager.stream_for("toy_pipeline");
 
+        // Warmup / compilación JIT previa
         out_matmul = A.matmul(B, stream);
         out_gelu = out_matmul.gelu(stream);
         out_softmax = out_gelu.softmax(stream);
         stream.synchronize();
 
+        // Iniciar sesión de telemetría explícitamente
+        manager.telemetry().start_session();
+
         // --- Benchmark SIN graph capture ---
         std::vector<ReplayTelemetry> no_capture_log;
         no_capture_log.reserve(kReplays);
+
         for (int i = 0; i < kReplays; ++i)
         {
-            float ms = time_kernel_ms(stream, [&]
-            {
+            // 1. Mide GPU real para Matmul
+            float ms_matmul = time_kernel_ms(stream, [&] {
                 out_matmul = A.matmul(B, stream);
+            });
+            manager.telemetry().record("matmul", OpKind::Gemm, ms_matmul, stream.raw(), false);
+
+            // 2. Mide GPU real para GELU
+            float ms_gelu = time_kernel_ms(stream, [&] {
                 out_gelu = out_matmul.gelu(stream);
+            });
+            manager.telemetry().record("gelu", OpKind::Elementwise, ms_gelu, stream.raw(), false);
+
+            // 3. Mide GPU real para Softmax
+            float ms_softmax = time_kernel_ms(stream, [&] {
                 out_softmax = out_gelu.softmax(stream);
             });
-            manager.telemetry().record("toy_pipeline_no_capture", OpKind::Other, ms,
-                                       stream.raw(), /*from_graph_replay=*/false);
-            no_capture_log.push_back({i, ms});
+            manager.telemetry().record("softmax", OpKind::Reduction, ms_softmax, stream.raw(), false);
+
+            no_capture_log.push_back({i, ms_matmul + ms_gelu + ms_softmax});
         }
         print_telemetry("sin_capture", no_capture_log);
 
@@ -140,9 +151,6 @@ int main()
         print_telemetry("graph_replay", replay_log);
 
         // --- Correctness: graph replay vs ejecucion directa ---
-        // out_softmax en este punto quedo escrito por el ULTIMO
-        // manager.launch() del loop de arriba -- ese es el resultado
-        // de graph replay que vamos a validar.
         auto vec_graph = out_softmax.to_vector();
 
         Tensor<__nv_bfloat16> ref_matmul = A.matmul(B, stream);

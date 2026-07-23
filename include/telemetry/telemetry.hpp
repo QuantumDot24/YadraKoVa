@@ -5,17 +5,9 @@
 #include <unordered_map>
 #include <chrono>
 #include <cstdint>
+#include "op_kind.hpp"
 
 namespace yadrakova::core {
-
-    enum class OpKind {
-        Gemm,
-        Elementwise,
-        Reduction,
-        GraphReplay,
-        Memcpy,
-        Other
-    };
 
     const char* to_string(OpKind kind);
 

@@ -5,17 +5,20 @@
 
 namespace yadrakova::core {
 
-const char* to_string(OpKind kind) {
-    switch (kind) {
+    const char* to_string(OpKind kind) {
+        switch (kind) {
         case OpKind::Gemm:        return "gemm";
+        case OpKind::Gemv:        return "gemv";        // <---
         case OpKind::Elementwise: return "elementwise";
         case OpKind::Reduction:   return "reduction";
+        case OpKind::Attention:   return "attention";   // <---
+        case OpKind::Conv2D:      return "conv2d";      // <---
         case OpKind::GraphReplay: return "graph_replay";
         case OpKind::Memcpy:      return "memcpy";
         case OpKind::Other:       return "other";
+        }
+        return "other";
     }
-    return "other";
-}
 
 Telemetry::Telemetry(size_t reserve_capacity) {
     records_.reserve(reserve_capacity);
