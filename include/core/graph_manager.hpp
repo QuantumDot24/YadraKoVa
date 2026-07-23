@@ -1,6 +1,7 @@
 #pragma once
 #include "core/graph.hpp"
 #include "core/stream.hpp"
+#include "telemetry/telemetry.hpp"
 #include <unordered_map>
 #include <memory>
 #include <string>
@@ -8,18 +9,26 @@
 
 namespace yadrakova::core {
 
-// Punto unico de orquestacion para multiples Graph con nombre --
-// pensado exactamente para el caso GAN: "G_forward", "G_backward",
-// "D_forward", "D_backward" viven aqui, y el loop de training (en
-// train/, no en core/) decide el orden/alternancia lanzandolos por
-// nombre. El core no sabe ni le importa que es una GAN -- solo
-// gestiona el ciclo de vida de N grafos nombrados.
+// Punto unico de orquestacion para multiples Graph con nombre -- pensado
+// exactamente para el caso GAN: "G_forward", "G_backward", "D_forward",
+// "D_backward" viven aqui, y el loop de training (en train/, no en core/)
+// decide el orden/alternancia lanzandolos por nombre. El core no sabe ni
+// le importa que es una GAN -- solo gestiona el ciclo de vida de N grafos
+// nombrados.
 //
 // Multi-stream: ademas de poder lanzar un grafo pasandole tu propio
 // Stream (como antes), el manager puede asignarle a cada grafo nombrado
 // un Stream propio, creado lazy la primera vez que se pide. Eso permite
 // correr, por ejemplo, "training" y "telemetry" en paralelo sin que el
 // caller tenga que gestionar los Streams a mano.
+//
+// Telemetry: una sola instancia compartida por el manager (igual
+// que pool_), no una por grafo -- asi un consumidor externo (el bridge
+// a MQTT/Android) lee un solo stream de eventos con todos los grafos
+// entrelazados por sequence_id/host_timestamp_ms, en vez de tener que
+// mergear N telemetrias por separado. El manager no llama record()
+// por su cuenta (ver nota en telemetry(), mas abajo); el caller decide
+// cuando medir.
 class GraphManager {
 public:
     explicit GraphManager(MemoryPool& pool = default_pool());
@@ -70,10 +79,23 @@ public:
 
     MemoryPool& pool() { return pool_; }
 
+    // Telemetria compartida del manager. El manager NO graba eventos
+    // por su cuenta -- ni en launch() ni en capture() -- a proposito:
+    // medir aqui adentro forzaria una sincronizacion (via time_kernel_ms
+    // o equivalente) en cada llamada, lo cual rompe el benchmark de
+    // graph replay real (el punto de graph replay es encolar sin pagar
+    // ese costo en cada iteracion). El caller decide cuando medir:
+    //   float ms = time_kernel_ms(stream, [&] { manager.launch("G_forward"); });
+    //   manager.telemetry().record("G_forward", OpKind::GraphReplay, ms,
+    //                               stream.raw(), /*from_graph_replay=*/true);
+    Telemetry& telemetry() { return telemetry_; }
+    const Telemetry& telemetry() const { return telemetry_; }
+
 private:
     MemoryPool& pool_;
     std::unordered_map<std::string, std::unique_ptr<Graph>> graphs_;
     std::unordered_map<std::string, std::unique_ptr<Stream>> owned_streams_;
+    Telemetry telemetry_;
 };
 
 } // namespace yadrakova::core

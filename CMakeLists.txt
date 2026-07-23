@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 4.3)
 project(YadraKoVa LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(PahoMqttCpp CONFIG REQUIRED)
 find_program(PYTHON3_EXECUTABLE NAMES python3 python REQUIRED)
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,7 @@ set_target_properties(yadrakova_core PROPERTIES
 target_link_libraries(yadrakova_core PUBLIC
         CUDA::cudart
         CUDA::cuda_driver
+        PahoMqttCpp::paho-mqttpp3
 )
 
 # ---------------------------------------------------------------------------

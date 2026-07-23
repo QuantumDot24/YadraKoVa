@@ -1,25 +1,30 @@
 #include "core/tensor.hpp"
 #include "core/graph_manager.hpp"
 #include "core/event.hpp"
+#include "telemetry/telemetry.hpp"
 #include <iostream>
 #include <vector>
 #include <cassert>
 #include <cmath>
 
+#include "telemetry/telemetry_mqtt_publisher.hpp"
+
 using namespace yadrakova::core;
 
-struct ReplayTelemetry {
+struct ReplayTelemetry
+{
     int replay_idx;
     float ms;
 };
 
-void print_telemetry(const std::string& label, const std::vector<ReplayTelemetry>& log) {
+void print_telemetry(const std::string& label, const std::vector<ReplayTelemetry>& log)
+{
     float total = 0.0f;
     for (const auto& e : log) total += e.ms;
     std::cout << "[" << label << "] " << log.size() << " replays, "
-              << "avg " << (total / log.size()) << " ms, "
-              << "primer replay " << log.front().ms << " ms, "
-              << "ultimo replay " << log.back().ms << " ms\n";
+        << "avg " << (total / log.size()) << " ms, "
+        << "primer replay " << log.front().ms << " ms, "
+        << "ultimo replay " << log.back().ms << " ms\n";
 }
 
 // Mismo criterio que matmul_test.cpp: diff <= atol + rtol * |ref|.
@@ -40,13 +45,15 @@ void check_pipeline_replay_matches_direct(
     size_t mismatches = 0;
     float max_abs = 0.0f, max_rel = 0.0f;
 
-    for (size_t i = 0; i < vec_graph.size(); ++i) {
+    for (size_t i = 0; i < vec_graph.size(); ++i)
+    {
         float a = __bfloat162float(vec_graph[i]);
         float b = __bfloat162float(vec_ref[i]);
         float diff = std::fabs(a - b);
         float allowed_tol = atol + rtol * std::fabs(b);
 
-        if (diff > allowed_tol) {
+        if (diff > allowed_tol)
+        {
             ++mismatches;
             max_abs = std::max(max_abs, diff);
             max_rel = std::max(max_rel, diff / std::max(std::fabs(b), 1e-6f));
@@ -54,18 +61,23 @@ void check_pipeline_replay_matches_direct(
     }
 
     std::cout << "  [" << label << "] correctness graph_replay vs direct: ";
-    if (mismatches > 0) {
+    if (mismatches > 0)
+    {
         std::cout << "[FAIL] " << mismatches << " / " << vec_graph.size()
-                   << " fuera de tolerancia | max_abs=" << max_abs
-                   << " max_rel=" << max_rel << "\n";
+            << " fuera de tolerancia | max_abs=" << max_abs
+            << " max_rel=" << max_rel << "\n";
         assert(mismatches == 0);
-    } else {
+    }
+    else
+    {
         std::cout << "[PASS]\n";
     }
 }
 
-int main() {
-    try {
+int main()
+{
+    try
+    {
         MemoryPool pool(0);
         GraphManager manager(pool);
 
@@ -81,28 +93,33 @@ int main() {
 
         Stream& stream = manager.stream_for("toy_pipeline");
 
-        out_matmul  = A.matmul(B, stream);
-        out_gelu    = out_matmul.gelu(stream);
+        out_matmul = A.matmul(B, stream);
+        out_gelu = out_matmul.gelu(stream);
         out_softmax = out_gelu.softmax(stream);
         stream.synchronize();
 
         // --- Benchmark SIN graph capture ---
         std::vector<ReplayTelemetry> no_capture_log;
         no_capture_log.reserve(kReplays);
-        for (int i = 0; i < kReplays; ++i) {
-            float ms = time_kernel_ms(stream, [&] {
-                out_matmul  = A.matmul(B, stream);
-                out_gelu    = out_matmul.gelu(stream);
+        for (int i = 0; i < kReplays; ++i)
+        {
+            float ms = time_kernel_ms(stream, [&]
+            {
+                out_matmul = A.matmul(B, stream);
+                out_gelu = out_matmul.gelu(stream);
                 out_softmax = out_gelu.softmax(stream);
             });
+            manager.telemetry().record("toy_pipeline_no_capture", OpKind::Other, ms,
+                                       stream.raw(), /*from_graph_replay=*/false);
             no_capture_log.push_back({i, ms});
         }
         print_telemetry("sin_capture", no_capture_log);
 
         // --- Captura ---
-        manager.capture("toy_pipeline", /*strict=*/true, [&] {
-            out_matmul  = A.matmul(B, stream);
-            out_gelu    = out_matmul.gelu(stream);
+        manager.capture("toy_pipeline", /*strict=*/true, [&]
+        {
+            out_matmul = A.matmul(B, stream);
+            out_gelu = out_matmul.gelu(stream);
             out_softmax = out_gelu.softmax(stream);
         });
         assert(manager.get("toy_pipeline").is_instantiated());
@@ -110,10 +127,14 @@ int main() {
         // --- Benchmark CON graph replay ---
         std::vector<ReplayTelemetry> replay_log;
         replay_log.reserve(kReplays);
-        for (int i = 0; i < kReplays; ++i) {
-            float ms = time_kernel_ms(stream, [&] {
+        for (int i = 0; i < kReplays; ++i)
+        {
+            float ms = time_kernel_ms(stream, [&]
+            {
                 manager.launch("toy_pipeline");
             });
+            manager.telemetry().record("toy_pipeline", OpKind::GraphReplay, ms,
+                                       stream.raw(), /*from_graph_replay=*/true);
             replay_log.push_back({i, ms});
         }
         print_telemetry("graph_replay", replay_log);
@@ -124,8 +145,8 @@ int main() {
         // de graph replay que vamos a validar.
         auto vec_graph = out_softmax.to_vector();
 
-        Tensor<__nv_bfloat16> ref_matmul  = A.matmul(B, stream);
-        Tensor<__nv_bfloat16> ref_gelu    = ref_matmul.gelu(stream);
+        Tensor<__nv_bfloat16> ref_matmul = A.matmul(B, stream);
+        Tensor<__nv_bfloat16> ref_gelu = ref_matmul.gelu(stream);
         Tensor<__nv_bfloat16> ref_softmax = ref_gelu.softmax(stream);
         stream.synchronize();
         auto vec_ref = ref_softmax.to_vector();
@@ -133,8 +154,16 @@ int main() {
         check_pipeline_replay_matches_direct(vec_graph, vec_ref, "toy_pipeline");
 
         std::cout << "Toy pipeline test OK.\n";
+
+        // --- Telemetria: publicar a MQTT para la app Android ---
+        std::cout << "\n--- telemetry (publicando a MQTT) ---\n";
+        TelemetryMqttPublisher publisher("tcp://localhost:1883", "yadrakova_benchmark");
+        bool ok = publisher.publish_lines(manager.telemetry().export_all_as_json_lines(),
+                                          "yadrakova/telemetry");
+        std::cout << (ok ? "Telemetria publicada OK.\n" : "Fallo publicando telemetria (broker caido?).\n");
     }
-    catch (const std::exception& e) {
+    catch (const std::exception& e)
+    {
         std::cerr << "EXCEPTION: " << e.what() << "\n";
         return 1;
     }
