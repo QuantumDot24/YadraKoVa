@@ -3,7 +3,6 @@
 #include <map>
 #include <vector>
 #include <mutex>
-#include <stdexcept>
 #include <iostream>
 
 namespace yadrakova::core {
