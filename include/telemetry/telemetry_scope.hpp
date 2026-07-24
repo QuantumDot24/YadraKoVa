@@ -1,6 +1,7 @@
 #pragma once
 #include "telemetry/telemetry.hpp"
 #include <cuda_runtime.h>
+#include "core/stream.hpp"
 
 namespace yadrakova::core {
 
@@ -43,5 +44,14 @@ namespace yadrakova::core {
         double gflops_;
         size_t handle_ = 0;
     };
+    template <typename F>
+     auto Telemetry::time(std::string label, OpKind kind, Stream& stream, F&& fn,
+                            bool from_graph_replay, uint64_t bytes_moved, double gflops)
+         -> decltype(fn())
+    {
+        TelemetryScope scope(this, std::move(label), kind, stream.raw(), &stream,
+                              from_graph_replay, bytes_moved, gflops);
+        return fn();
+    }
 
 } // namespace yadrakova::core

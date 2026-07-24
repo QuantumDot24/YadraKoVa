@@ -1,8 +1,6 @@
 #include "core/tensor.hpp"
 #include "core/graph_manager.hpp"
-#include "telemetry/telemetry.hpp"
-#include "telemetry/telemetry_scope.hpp"
-#include "telemetry/telemetry_mqtt_publisher.hpp"
+#include "telemetry/kova_metry.hpp"
 #include <iostream>
 #include <vector>
 #include <cassert>
@@ -10,62 +8,7 @@
 
 using namespace yadrakova::core;
 
-// Reconstruct the console summary from the already resolved records
-// (real duration_ms, post resolve_pending()) instead of time_kernel_ms.
-void print_telemetry_from_records(const std::string& label_filter,
-                                   const std::vector<TelemetryRecord>& records,
-                                   size_t expected_count)
-{
-    std::vector<float> durations;
-    durations.reserve(expected_count);
-
-    // If label_filter is "toy_pipeline" (graph replay), each record is already
-    // a complete replay. If it is "" (no capture), we group matmul+gelu+softmax
-    // in groups of 3 to reconstruct the total per iteration.
-    if (label_filter == "toy_pipeline")
-    {
-        for (const auto& r : records)
-        {
-            if (r.label == "toy_pipeline") durations.push_back(r.duration_ms);
-        }
-    }
-    else
-    {
-        float acc = 0.0f;
-        int count_in_group = 0;
-        for (const auto& r : records)
-        {
-            if (r.label == "matmul" || r.label == "gelu" || r.label == "softmax")
-            {
-                acc += r.duration_ms;
-                ++count_in_group;
-                if (count_in_group == 3)
-                {
-                    durations.push_back(acc);
-                    acc = 0.0f;
-                    count_in_group = 0;
-                }
-            }
-        }
-    }
-
-    if (durations.empty())
-    {
-        std::cout << "[" << label_filter << "] no resolved data\n";
-        return;
-    }
-
-    float total = 0.0f;
-    for (float d : durations) total += d;
-
-    std::cout << "[" << (label_filter.empty() ? "no_capture" : label_filter) << "] "
-        << durations.size() << " replays, "
-        << "avg " << (total / durations.size()) << " ms, "
-        << "first replay " << durations.front() << " ms, "
-        << "last replay " << durations.back() << " ms\n";
-}
-
-void check_pipeline_replay_matches_direct(
+static void check_pipeline_replay_matches_direct(
     const std::vector<__nv_bfloat16>& vec_graph,
     const std::vector<__nv_bfloat16>& vec_ref,
     const std::string& label)
@@ -111,23 +54,20 @@ int main()
 {
     try
     {
-        MemoryPool pool(0);
-        GraphManager manager(pool);
+        GraphManager manager;
 
         const int64_t M = 512, K = 512, N = 16;
         constexpr int kReplays = 50;
 
-        Tensor<__nv_bfloat16> A = Tensor<__nv_bfloat16>::randn({M, K}, 1, pool);
-        Tensor<__nv_bfloat16> B = Tensor<__nv_bfloat16>::randn({K, N}, 2, pool);
+        Tensor<__nv_bfloat16> A = Tensor<__nv_bfloat16>::randn({M, K}, 1, manager.pool());
+        Tensor<__nv_bfloat16> B = Tensor<__nv_bfloat16>::randn({K, N}, 2, manager.pool());
 
-        Tensor<__nv_bfloat16> out_matmul({M, N}, pool);
-        Tensor<__nv_bfloat16> out_gelu({M, N}, pool);
-        Tensor<__nv_bfloat16> out_softmax({M, N}, pool);
+        Tensor<__nv_bfloat16> out_matmul({M, N}, manager.pool());
+        Tensor<__nv_bfloat16> out_gelu({M, N}, manager.pool());
+        Tensor<__nv_bfloat16> out_softmax({M, N}, manager.pool());
 
         Stream& stream = manager.stream_for("toy_pipeline");
-        cudaStream_t raw_stream = stream.raw();
 
-        // Warmup / previous JIT compilation
         out_matmul = A.matmul(B, stream);
         out_gelu = out_matmul.gelu(stream);
         out_softmax = out_gelu.softmax(stream);
@@ -135,56 +75,31 @@ int main()
 
         manager.telemetry().start_session();
 
-        // --- Benchmark WITHOUT graph capture (via TelemetryScope, no sync in hot path) ---
-        for (int i = 0; i < kReplays; ++i)
+        manager.benchmark("no_capture", 3, kReplays, [&](int)
         {
-            {
-                TelemetryScope scope(&manager.telemetry(), "matmul", OpKind::Gemm, raw_stream);
-                out_matmul = A.matmul(B, stream);
-            }
-            {
-                TelemetryScope scope(&manager.telemetry(), "gelu", OpKind::Elementwise, raw_stream);
-                out_gelu = out_matmul.gelu(stream);
-            }
-            {
-                TelemetryScope scope(&manager.telemetry(), "softmax", OpKind::Reduction, raw_stream);
-                out_softmax = out_gelu.softmax(stream);
-            }
-        }
+            manager.time("matmul", OpKind::Gemm, stream, [&] { out_matmul = A.matmul(B, stream); });
+            manager.time("gelu", OpKind::Elementwise, stream, [&] { out_gelu = out_matmul.gelu(stream); });
+            manager.time("softmax", OpKind::Reduction, stream, [&] { out_softmax = out_gelu.softmax(stream); });
+        });
 
-        // --- Capture ---
-        manager.capture("toy_pipeline", /*strict=*/true, [&]
+        manager.capture("toy_pipeline", true, [&]
         {
             out_matmul = A.matmul(B, stream);
             out_gelu = out_matmul.gelu(stream);
             out_softmax = out_gelu.softmax(stream);
         });
-        assert(manager.get("toy_pipeline").is_instantiated());
-
-        // Graph warmup: the first launch after cudaGraphInstantiate pays
-        // the cost of uploading the topology to the device (graph upload),
-        // something that does not repeat in subsequent replays. Just like
-        // above with matmul/gelu/softmax, it is discarded and not included
-        // in the measured telemetry.
         manager.launch("toy_pipeline");
         stream.synchronize();
 
-        // --- Benchmark WITH graph replay (via TelemetryScope) ---
-        for (int i = 0; i < kReplays; ++i)
+        manager.benchmark("toy_pipeline", 1, kReplays, [&](int)
         {
-            TelemetryScope scope(&manager.telemetry(), "toy_pipeline", OpKind::GraphReplay,
-                                  raw_stream, raw_stream, /*from_graph_replay=*/true);
-            manager.launch("toy_pipeline");
-        }
+            manager.time("toy_pipeline", OpKind::GraphReplay, stream,
+                         [&] { manager.launch("toy_pipeline"); }, /*from_graph_replay=*/true);
+        });
 
-        // Single synchronization point: resolves ALL pending events
-        // (no_capture + graph_replay) and dumps them into records_.
         manager.telemetry().resolve_pending();
-
-        // Reconstruct the console logs from the already resolved records.
-        print_telemetry_from_records("", manager.telemetry().records(), kReplays);
-        print_telemetry_from_records("toy_pipeline", manager.telemetry().records(), kReplays);
-
+        manager.telemetry().print_summary("no_capture");
+        manager.telemetry().print_summary("toy_pipeline");
         // --- Correctness: graph replay vs direct execution ---
         auto vec_graph = out_softmax.to_vector();
 

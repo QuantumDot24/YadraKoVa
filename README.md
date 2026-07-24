@@ -1,131 +1,134 @@
-![Diagrama de arquitectura](architecture.png)
+# YadraKoVa
 
-# Cómo agregar una nueva arquitectura de GPU a YadraKoVa
+CUDA-native C++ engine for on-device AI training and inference, built from scratch for NVIDIA GPUs (primary target: RTX 3060, `sm_86`). Part of the **Yadra ecosystem**, alongside [YadraCore](#) (Vulkan/Android inference) and YadraTrain (on-device Android LoRA fine-tuning).
 
-Esta guía documenta el proceso completo para que YadraKoVa soporte una GPU con
-una `compute capability` que todavía no conoce (ej. pasar de una RTX 3060
-sm_86 a una RTX 5090 sm_120, o a un datacenter Blackwell sm_100).
+BF16 is the default dtype throughout the engine, with explicit support for FP32, FP16, and INT8.
 
-## Antes de empezar: identifica el compute capability real
+## Highlights
 
-No asumas por el nombre comercial de la tarjeta. Verifica el compute
-capability exacto en la [tabla oficial de NVIDIA](https://developer.nvidia.com/cuda-gpus).
+- **WMMA Tensor Core matmul kernel** in BF16 reaching ~9,305 GFLOPS on RTX 3060 (~54.5% of cuBLAS), benchmarked with Nsight Compute's internal Duration measurement to avoid replay-pass timing inflation.
+- **CUDA Graph capture** for full pipelines (matmul → GELU → softmax), with strict memory-growth checks during capture.
+- **YAML-driven kernel codegen**: kernel dispatch rules (grid/block dims) and registration are generated at build time from `.yaml` + `.cu` pairs, with explicit-instantiation dtype overrides per kernel.
+- **Async telemetry pipeline**: zero-sync-in-hot-path CUDA event timing, resolved in a single batched sync point, exported as JSON Lines and published over MQTT for real-time consumption by the Android side of the ecosystem.
 
-Ejemplos de referencia (verificar siempre, esto puede cambiar con nuevos lanzamientos):
-- RTX 3060 → sm_86 (Ampere)
-- RTX 5090 → sm_120 (Blackwell consumer)
-- B100 / B200 (datacenter) → sm_100 (Blackwell datacenter)
+## Architecture
 
-Blackwell consumer y Blackwell datacenter **no comparten compute capability**,
-aunque compartan nombre de arquitectura. Trátalas como entradas separadas.
+```mermaid
+flowchart TB
 
-## Cuándo necesitas seguir esta guía completa vs. cuándo no
+    subgraph BUILD["Build-time codegen"]
+        YAML["kernel.yaml<br/>(dispatch rules)"]
+        CU["kernel.cu<br/>(WMMA / GELU / Softmax)"]
+        CODEGEN["compile_kernel.py"]
+        CUBIN[".cubin"]
+        REGCPP["*_registration.cpp"]
+        DISPCPP["*_dispatch.generated.cpp"]
 
-- **Comprar una segunda GPU con la misma arch que ya soportas** (ej. ya tienes
-  una sm_86 y compras otra sm_86): no necesitas tocar nada. `Device` la
-  detecta sola en runtime.
-- **Comprar una GPU con compute capability nuevo**: sigue todos los pasos de
-  abajo.
+        CU --> CODEGEN
+        YAML --> CODEGEN
+        CODEGEN --> CUBIN
+        CODEGEN --> REGCPP
+        CODEGEN --> DISPCPP
+    end
 
-## Pasos
+    subgraph CORE["Core runtime (yadrakova::core)"]
+        TENSOR["Tensor&lt;T&gt;<br/>(bf16 / fp32 / fp16 / int8)"]
+        MEMPOOL["MemoryPool<br/>(free-list, shared_ptr Impl)"]
+        STREAM["Stream"]
+        EVENT["Event / time_kernel_ms"]
+        EXECUTOR["Executor::execute&lt;T&gt;"]
+        DEVICE["Device<br/>(singleton, arch detection)"]
+        DISPREG["DispatchRegistry<br/>(kernel_name -> grid/block dims)"]
+        KERNELREG["KernelRegistry<br/>(kernel_name, arch, dtype -> CUfunction)"]
+        GRAPH["Graph<br/>(capture / instantiate / launch)"]
+        GRAPHMGR["GraphManager<br/>(named graphs + owned streams)"]
 
-### 1. `include/kernels/registry.hpp` — agregar el valor al enum
+        TENSOR --> MEMPOOL
+        TENSOR --> STREAM
+        TENSOR --> EXECUTOR
+        EXECUTOR --> DISPREG
+        EXECUTOR --> KERNELREG
+        EXECUTOR --> DEVICE
+        DISPREG -.uses.-> DISPCPP
+        KERNELREG -.loads.-> CUBIN
+        KERNELREG -.registers via.-> REGCPP
 
-```cpp
-enum class Arch { SM_86, SM_100, SM_120 };  // agrega el nuevo valor
+        GRAPHMGR --> GRAPH
+        GRAPHMGR --> STREAM
+        GRAPH --> MEMPOOL
+        GRAPH --> STREAM
+    end
+
+    subgraph TELEMETRY["Telemetry (kova_metry.hpp facade)"]
+        TELEM["Telemetry<br/>(begin_group/time/benchmark/print_summary)"]
+        SCOPE["TelemetryScope<br/>(RAII, async CUDA events)"]
+        MQTT["TelemetryMqttPublisher"]
+        BROKER[("MQTT Broker<br/>Mosquitto")]
+        ANDROID["Android App<br/>(YadraLyuda telemetry UI)"]
+
+        GRAPHMGR --> TELEM
+        TELEM --> SCOPE
+        SCOPE -.records via.-> TELEM
+        TELEM --> MQTT
+        MQTT --> BROKER
+        BROKER --> ANDROID
+    end
+
+    subgraph TESTS["Tests (CTest, one exe per file)"]
+        TESTEXE["test_*.exe"]
+        LIB["yadrakova_core.lib<br/>(/WHOLEARCHIVE)"]
+
+        TESTEXE --> LIB
+        LIB --> TENSOR
+        LIB --> GRAPHMGR
+        LIB --> TELEM
+    end
 ```
 
-Este enum es el vocabulario compartido entre el codegen de build-time
-(`compile_kernel.py`) y la selección de kernel en runtime (`KernelRegistry`,
-`Device`). Vive aquí porque `KernelRegistry` es quien lo usa como parte de su
-clave de búsqueda.
+## Core components
 
-### 2. `src/core/device.cpp` — mapear compute capability → `Arch`
+| Component | Responsibility |
+|---|---|
+| `Tensor<T>` | Templated N-D tensor (bf16/fp32/fp16/int8), view ops (transpose/permute/slice/reshape) with zero copy, host↔device transfers, factory methods (`randn`, `from_vector`, `from_nested`) |
+| `MemoryPool` | Size-class free-list allocator; `Impl` kept alive via `shared_ptr` shared with every outstanding `DeviceBuffer`, so pool destruction order never races against live tensors |
+| `Stream` / `Event` | RAII wrappers over `cudaStream_t` / `cudaEvent_t`; `time_kernel_ms` for one-off synchronous timing |
+| `Executor` | Resolves a kernel name + dtype + current `Device::arch()` into a `CUfunction` (via `KernelRegistry`) and grid/block dims (via `DispatchRegistry`), then launches it |
+| `Device` | Singleton; detects compute capability once and maps it to a `kernels::Arch` |
+| `DispatchRegistry` | Maps `(kernel_name, DimMap)` → grid/block/shared-mem launch config |
+| `KernelRegistry` | Maps `(kernel_name, arch, dtype)` → compiled `CUfunction`, loaded from generated `.cubin`s |
+| `Graph` / `GraphManager` | Wraps `cudaStreamBeginCapture`/`cudaGraphInstantiate`/`cudaGraphLaunch`; `GraphManager` owns N named graphs, N named streams (created lazily), and one shared `Telemetry` instance |
+| `Telemetry` | Async, zero-sync-in-hot-path event timing: `begin_async`/`end_async` queue CUDA events, `resolve_pending()` is the single batched sync point. Groups (`begin_group`/`end_group`) tag records so `print_summary()` reconstructs per-iteration timings without magic constants |
+| `TelemetryMqttPublisher` | Fire-and-forget (QoS 0) publisher of exported JSON Lines telemetry, decoupled from `Telemetry` itself so the transport can change without touching measurement code |
 
-En `Device::map_arch`, agrega el caso correspondiente:
+## Kernel codegen pipeline
 
-```cpp
-kernels::Arch Device::map_arch(int major, int minor) {
-    int cc = major * 10 + minor;
-    switch (cc) {
-        case 86:  return kernels::Arch::SM_86;
-        case 100: return kernels::Arch::SM_100;
-        case 120: return kernels::Arch::SM_120;  // <- nuevo
-        default:
-            throw std::runtime_error(/* ... */);
-    }
-}
-```
+Each kernel lives as a `.cu` file under `src/kernels/`. If a matching `.yaml` exists next to it, CMake additionally generates a `*_dispatch.generated.cpp` (dispatch rules) alongside the always-generated `*_registration.cpp` (kernel registration). This is an incremental, kernel-by-kernel migration — kernels without a `.yaml` yet are reported at configure time and still work via the older registration-only path.
 
-`Device` detecta la GPU real en runtime vía `cudaGetDeviceProperties` y
-traduce major/minor a este enum. Si te saltas este paso, el programa truena
-al arrancar con un mensaje explicando exactamente qué falta (por diseño, no
-falla en silencio).
+Output files are declared explicitly in `CMakeLists.txt` (not globbed), so Ninja treats them as real dependencies regardless of the codegen script's own caching — this closes a race condition that used to cause stale "kernel not registered" errors on incremental builds.
 
-### 3. `scripts/compile_kernel.py` — agregar a los diccionarios de mapeo
+## Building
 
-```python
-ARCH_TO_SM = {"sm_86": "86", "sm_100": "100", "sm_120": "120"}
-ARCH_TO_ENUM = {"sm_86": "Arch::SM_86", "sm_100": "Arch::SM_100", "sm_120": "Arch::SM_120"}
-```
-
-Estos diccionarios traducen el string del `config.yaml` (`sm_120`) al flag
-real de `nvcc` (`-arch=sm_120`) y al literal C++ (`Arch::SM_120`) que se
-escribe en los `.cpp` de registro autogenerados.
-
-### 4. `config.yaml` — activar la arquitectura en el build
-
-```yaml
-cuda:
-  architectures: [sm_86, sm_120]
-  arch_flags:
-    sm_86:
-      extra_flags: []
-    sm_120:
-      extra_flags: []   # flags especificas de la arch, si aplica
-```
-
-Este es el único paso que "enciende" la compilación para la arch nueva. Los
-pasos 1-3 son vocabulario que se toca una sola vez por arquitectura nunca
-antes vista; este paso 4 es el que controla qué se compila en cada build.
-
-### 5. Recompilar
+Requirements: CUDA Toolkit (tested with 13.2), CMake ≥ 4.3, a C++23 + CUDA 20 compiler (tested with MSVC from VS 2026), `PahoMqttCpp` (via vcpkg), Python 3.
 
 ```bash
-python scripts/compile_kernel.py
+cmake -B cmake-build-debug -S .
+cmake --build cmake-build-debug -j 14
+ctest --test-dir cmake-build-debug
 ```
 
-Esto regenera automáticamente los `_embedded.cuh` y `_registration.cpp` de
-**todos** los kernels existentes (`gelu`, `matmul_wmma`, etc.) para incluir
-también los cubins de la arch nueva. No hay que tocar el código fuente `.cu`
-de cada kernel individual para que compile en la arch nueva.
+`CMAKE_CUDA_ARCHITECTURES` is currently pinned to `86` (RTX 3060). Adding a new architecture requires updating `Device::map_arch`, the `kernels::Arch` enum, and `config.yaml`.
 
-### 6. Nada más
+## Project structure
 
-`Device` detecta automáticamente en runtime qué GPU hay presente y pide a
-`KernelRegistry` el cubin correspondiente. `Executor` no necesita ningún
-cambio — nunca tuvo hardcodeada la arch, siempre le pregunta a `Device`.
+```
+include/          public headers (core/, telemetry/, kernels/)
+src/core/         Tensor, MemoryPool, Stream, Event, Graph, GraphManager, Device, Executor
+src/telemetry/    Telemetry, TelemetryScope, TelemetryMqttPublisher
+src/kernels/      .cu kernels + matching .yaml dispatch rules
+scripts/          compile_kernel.py (codegen)
+tests/            one executable per test file, auto-discovered by CTest
+```
 
-## Nota sobre aprovechar features nuevas de la arquitectura
+## Status
 
-Compilar para una arch nueva (pasos 1-5) garantiza que el kernel **corre**
-correctamente ahí — `nvcc` traduce el código CUDA existente al ISA de la
-nueva arquitectura. Pero **no garantiza que estés aprovechando** hardware
-nuevo exclusivo de esa arch (ej. tipos de dato fp4/fp6 en Blackwell
-datacenter, cambios en cómo se invocan los fragments de Tensor Cores, nuevas
-instrucciones WGMMA/TMA, etc.).
-
-Aprovechar eso requiere escribir una variante del kernel específica para esa
-arch (ej. `matmul_wmma_sm120.cu` con su propio path de código), lo cual es
-trabajo de kernel-engineering, no de infraestructura. Cuando llegue ese
-momento, es un proyecto aparte de "hacer que compile en la arch nueva".
-
-## Checklist rápido
-
-- [ ] Confirmar compute capability real (major.minor) de la GPU nueva
-- [ ] `registry.hpp`: agregar valor al enum `Arch`
-- [ ] `device.cpp`: agregar case en `Device::map_arch`
-- [ ] `compile_kernel.py`: agregar entradas a `ARCH_TO_SM` y `ARCH_TO_ENUM`
-- [ ] `config.yaml`: agregar el string de arch a `cuda.architectures`
-- [ ] Correr `python scripts/compile_kernel.py`
-- [ ] Correr los tests existentes en la GPU nueva para confirmar
+Active development. Foundational architecture (tensor, memory pool, graph capture, kernel codegen, telemetry) is in place and passing tests. This is a solo, from-scratch project — no external ML framework dependencies in the runtime path.
