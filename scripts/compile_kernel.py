@@ -2,37 +2,38 @@
 """
 YadraKoVa kernel compiler + embedder + dispatch codegen.
 
-Escanea src/kernels/*.cu, compila cada uno a .cubin (SASS nativo, cero
-overhead de carga -- sin JIT) para cada combinacion arch x dtype
-definida en config.yaml, cachea por hash de contenido+flags+version de
-nvcc+headers compartidos para evitar recompilar innecesariamente.
+Scans src/kernels/*.cu, compiles each to .cubin (native SASS, zero
+load overhead -- no JIT) for every arch x dtype combination defined in
+config.yaml, caches by content+flags+nvcc version+shared headers hash
+to avoid unnecessary recompilation.
 
-Politica de cache: SOLO se conserva la version mas reciente de cada
-combinacion kernel+dtype+arch. Al detectar un cache miss (el kernel
-cambio), se borra automaticamente cualquier .cubin viejo de esa misma
-combinacion antes de compilar el nuevo -- pensado para iteracion
-constante de tuning de performance sin acumular basura para siempre.
+Cache policy: ONLY the most recent version of each kernel+dtype+arch
+combination is kept. On a cache miss (the kernel changed), any old
+.cubin for that same combination is automatically deleted before
+compiling the new one -- designed for constant performance tuning
+iteration without accumulating garbage forever.
 
-Genera TRES archivos por kernel, separando datos de efectos secundarios:
+Generates THREE files per kernel, separating data from side effects:
   - include/kernels/embedded/{kernel}_embedded.cuh
-        Solo datos (arrays de bytes). Header puro, sin side effects.
+        Data only (byte arrays). Pure header, no side effects.
   - generated/kernels/{kernel}_registration.cpp
-        Efecto secundario: registro estatico en KernelRegistry
-        (nombre -> CUfunction). Vive FUERA de include/, en el build
-        dir, generado y descartable.
-  - generated/kernels/{kernel}_dispatch.generated.cpp   [NUEVO]
-        Efecto secundario: registro estatico en DispatchRegistry
-        (nombre -> regla de calculo de grid/block), derivado de
-        src/kernels/{kernel}.yaml. Si el .yaml no existe, se omite
-        con un aviso -- permite migrar kernels uno por uno.
+        Side effect: static registration in KernelRegistry
+        (name -> CUfunction). Lives OUTSIDE include/, in the build
+        dir, generated and discardable.
+  - generated/kernels/{kernel}_dispatch.generated.cpp   [NEW]
+        Side effect: static registration in DispatchRegistry
+        (name -> grid/block computation rule), derived from
+        src/kernels/{kernel}.yaml. If the .yaml doesn't exist, it's
+        skipped with a warning -- allows migrating kernels one by one.
 
-El .yaml de dispatch vive junto al .cu (mismo stem, misma carpeta) y
-NO participa del hash de cache de compilacion de cubins: cambiar solo
-la regla de dispatch no deberia forzar una recompilacion de CUDA.
+The dispatch .yaml lives next to the .cu (same stem, same folder) and
+does NOT participate in the cubin compilation cache hash: changing only
+the dispatch rule should not force a CUDA recompilation.
 """
 import argparse
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import yaml  # pip install pyyaml
@@ -68,11 +69,11 @@ def nvcc_version() -> str:
 
 
 def hash_shared_headers(shared_headers_dir: Path) -> str:
-    """Hash combinado de TODOS los .cuh compartidos en include/kernels/
-    (common.cuh, etc. -- no los generados en embedded/, esos son
-    output, no input). Conservador a proposito: si CUALQUIER header
-    compartido cambia, invalida el cache de TODOS los kernels. Mas
-    seguro que un parser de #include que puede fallar silenciosamente."""
+    """Combined hash of ALL shared .cuh headers in include/kernels/
+    (common.cuh, etc. -- not the generated ones in embedded/, those are
+    output, not input). Intentionally conservative: if ANY shared header
+    changes, invalidates the cache of ALL kernels. Safer than an #include
+    parser that can fail silently."""
     h = hashlib.sha256()
     if not shared_headers_dir.exists():
         return h.hexdigest()
@@ -83,34 +84,45 @@ def hash_shared_headers(shared_headers_dir: Path) -> str:
 
 def prune_old_versions(source: Path, dtype: str, arch: str,
                        cache_dir: Path, keep_path: Path):
-    """Borra cualquier .cubin viejo de esta MISMA combinacion
-    kernel+dtype+arch (distinto hash = version anterior del mismo
-    archivo). Se llama SOLO en cache miss, justo antes de compilar
-    la version nueva -- garantiza que .kernel_cache/ nunca acumula
-    mas de una version por combinacion, sin importar cuantas veces
-    itere el kernel durante tuning."""
+    """Deletes any old .cubin for this SAME kernel+dtype+arch combination
+    (different hash = previous version of the same file). Called ONLY on
+    cache miss, just before compiling the new version -- guarantees that
+    .kernel_cache/ never accumulates more than one version per
+    combination, regardless of how many times the kernel is iterated
+    during tuning."""
     if not cache_dir.exists():
         return
     prefix = f"{source.stem}_{dtype}_{arch}_"
     for old_cubin in cache_dir.glob(f"{prefix}*.cubin"):
         if old_cubin != keep_path:
-            print(f"  [cache prune] version vieja: {old_cubin.name}")
+            print(f"  [cache prune] old version: {old_cubin.name}")
             old_cubin.unlink()
 
 
-def prune_orphaned_kernels(cache_dir: Path, valid_kernel_names: set):
-    """Borra .cubin de kernels cuyo .cu ya no existe (renombrado o
-    eliminado). Se llama UNA vez al final, sobre todo el cache."""
+def extract_kernel_name(cubin_stem: str, known_dtypes: set) -> str:
+    """Extracts kernel name from a cubin stem that may contain dtype.
+    Looks for pattern '_<dtype>_' and takes everything before it."""
+    for dtype in known_dtypes:
+        marker = f"_{dtype}_"
+        if marker in cubin_stem:
+            return cubin_stem[:cubin_stem.index(marker)]
+    # fallback: split by '_' and hope there's no dtype in the name (unreliable)
+    return cubin_stem.split("_")[0]
+
+
+def prune_orphaned_kernels(cache_dir: Path, valid_kernel_names: set, known_dtypes: set):
+    """Deletes .cubin files whose kernel .cu no longer exists (renamed or
+    deleted). Called ONCE at the end, over the entire cache."""
     if not cache_dir.exists():
         return
     removed = 0
     for cubin in cache_dir.glob("*.cubin"):
-        kernel_name = cubin.stem.split("_")[0]
+        kernel_name = extract_kernel_name(cubin.stem, known_dtypes)
         if kernel_name not in valid_kernel_names:
             cubin.unlink()
             removed += 1
     if removed:
-        print(f"[cache] {removed} .cubin huerfanos eliminados (kernel ya no existe)")
+        print(f"[cache] {removed} orphaned .cubin removed (kernel no longer exists)")
 
 
 def compile_one(source: Path, dtype: str, arch: str, cache_dir: Path,
@@ -162,12 +174,12 @@ def embed_cubin_bytes(cubin_path: Path, var_name: str) -> str:
 
 def write_cuh(kernel_name: str, archs: list, dtypes: list,
               cubins: dict, cuh_path: Path):
-    """Escribe el .cuh -- SOLO datos, cero efectos secundarios."""
+    """Writes the .cuh -- data ONLY, zero side effects."""
     lines = [
-        "// AUTOGENERADO por scripts/compile_kernel.py -- NO EDITAR A MANO.",
-        f"// Fuente: src/kernels/{kernel_name}.cu",
-        "// Solo datos (cubins embebidos). Sin efectos secundarios --",
-        "// seguro de incluir desde cualquier translation unit.",
+        "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
+        f"// Source: src/kernels/{kernel_name}.cu",
+        "// Data only (embedded cubins). No side effects --",
+        "// safe to include from any translation unit.",
         "#pragma once",
         "#include <cstddef>",
         "",
@@ -188,16 +200,16 @@ def write_cuh(kernel_name: str, archs: list, dtypes: list,
 def write_registration_cpp(kernel_name: str, archs: list, dtypes: list,
                            cuh_path: Path, registration_cpp_path: Path,
                            registry_header: Path):
-    """Escribe el .cpp de registro -- SOLO el efecto secundario.
-    Vive fuera de include/, en el build dir."""
+    """Writes the registration .cpp -- ONLY the side effect.
+    Lives outside include/, in the build dir."""
     cuh_include = Path(os.path.relpath(cuh_path, registration_cpp_path.parent)).as_posix()
     registry_include = Path(os.path.relpath(registry_header, registration_cpp_path.parent)).as_posix()
 
     lines = [
-        "// AUTOGENERADO por scripts/compile_kernel.py -- NO EDITAR A MANO.",
-        "// Efecto secundario: registro estatico en KernelRegistry.",
-        "// Vive fuera de include/ a proposito -- un .cpp con side",
-        "// effects no pertenece al arbol de headers.",
+        "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
+        "// Side effect: static registration in KernelRegistry.",
+        "// Lives outside include/ on purpose -- a .cpp with side",
+        "// effects does not belong in the header tree.",
         f'#include "{cuh_include}"',
         f'#include "{registry_include}"',
         "",
@@ -225,20 +237,20 @@ def write_registration_cpp(kernel_name: str, archs: list, dtypes: list,
 
 
 # --------------------------------------------------------------------------
-# NUEVO: codegen de dispatch (grid/block) a partir de src/kernels/{k}.yaml
+# NEW: dispatch codegen (grid/block) from src/kernels/{k}.yaml
 # --------------------------------------------------------------------------
 
 def _ceildiv_expr(numer: str, denom: int) -> str:
-    """ceil(numer/denom) en aritmetica entera, sin floats. numer es un
-    nombre de variable (M, N o K) que existe como parametro int64_t de
-    la funcion de dispatch generada; denom es un literal (block size),
-    conocido en tiempo de generacion."""
+    """ceil(numer/denom) in integer arithmetic, no floats. numer is a
+    variable name (M, N, K, or any dim name) that exists as an int64_t
+    parameter of the generated dispatch function; denom is a literal
+    (block size), known at generation time."""
     return f"(({numer} + {denom} - 1) / {denom})"
 
 
-# Cada helper declara a que dimensiones de grid (x/y/z) mapea cada uno
-# de sus argumentos posicionales. tile2d(filas, columnas) es el caso
-# comun de "un thread por elemento de una matriz 2D de salida".
+# Each helper declares which grid dimensions (x/y/z) each of its
+# positional arguments maps to. tile2d(rows, columns) is the common
+# case of "one thread per element of a 2D output matrix".
 GRID_HELPERS = {
     "tile2d": ("y", "x"),
     "rows": ("y",),
@@ -247,10 +259,10 @@ GRID_HELPERS = {
 }
 
 
-def parse_grid_spec(grid_field, block: list) -> dict:
-    """Devuelve {'x': cpp_expr, 'y': cpp_expr, 'z': cpp_expr}, expresado
-    en terminos de M/N/K (los parametros de la funcion de dispatch) con
-    el block size ya resuelto como literal entero."""
+def parse_grid_spec(grid_field, block: list, dim_names: list) -> dict:
+    """Returns {'x': cpp_expr, 'y': cpp_expr, 'z': cpp_expr}, expressed
+    in terms of the dimension names declared in the YAML (dim_names),
+    with the block size already resolved as an integer literal."""
     dims = {"x": "1", "y": "1", "z": "1"}
     block_by_dim = {"x": block[0], "y": block[1], "z": block[2] if len(block) > 2 else 1}
 
@@ -260,42 +272,40 @@ def parse_grid_spec(grid_field, block: list) -> dict:
         name = name.strip()
         if name not in GRID_HELPERS or not inner.endswith(")"):
             raise ValueError(
-                f"grid: '{grid_field}' no reconocido. Usa uno de "
-                f"{list(GRID_HELPERS)}(...) o la forma explicita {{x: .., y: ..}}"
+                f"grid: '{grid_field}' not recognized. Use one of "
+                f"{list(GRID_HELPERS)}(...) or the explicit form {{x: .., y: ..}}"
             )
         arg_names = [a.strip() for a in inner[:-1].split(",") if a.strip()]
         target_dims = GRID_HELPERS[name]
         if len(arg_names) != len(target_dims):
             raise ValueError(
-                f"grid: '{grid_field}' espera {len(target_dims)} argumento(s), "
-                f"recibio {len(arg_names)}"
+                f"grid: '{grid_field}' expects {len(target_dims)} argument(s), "
+                f"got {len(arg_names)}"
             )
         for var_name, dim in zip(arg_names, target_dims):
-            if var_name not in ("M", "N", "K"):
+            if var_name not in dim_names:
                 raise ValueError(
-                    f"grid: '{var_name}' no es M, N ni K -- revisa {grid_field}"
+                    f"grid: '{var_name}' is not declared in 'dims: {dim_names}' -- check {grid_field}"
                 )
             dims[dim] = _ceildiv_expr(var_name, block_by_dim[dim])
         return dims
 
     if isinstance(grid_field, dict):
-        # Forma explicita, fallback para casos que no encajan en un
-        # helper: cada componente es una expresion C++ escrita a mano,
-        # libre de usar M, N, K.
+        # Explicit form, fallback for cases that don't fit a helper:
+        # each component is a hand-written C++ expression, free to use
+        # the dimension names from dims.
         for dim in ("x", "y", "z"):
             if dim in grid_field:
                 dims[dim] = str(grid_field[dim])
         return dims
 
-    raise ValueError(f"grid: tipo no soportado ({type(grid_field).__name__}); usa string o dict")
+    raise ValueError(f"grid: unsupported type ({type(grid_field).__name__}); use string or dict")
 
 
 def find_dispatch_yaml(source: Path) -> Path | None:
     yaml_path = source.with_suffix(".yaml")
     return yaml_path if yaml_path.exists() else None
 
-
-import re
 
 SIG_RE = re.compile(
     r'__global__\s+void\s+\w+_kernel\s*\((.*?)\)\s*\{',
@@ -304,10 +314,10 @@ SIG_RE = re.compile(
 
 
 def parse_kernel_signature(source_text: str) -> list[tuple[str, str]]:
-    """Devuelve [(tipo_cpp, nombre), ...] en orden, desde la firma real."""
+    """Returns [(cpp_type, name), ...] in order, from the actual signature."""
     m = SIG_RE.search(source_text)
     if not m:
-        raise ValueError("No se encontro __global__ ...(...) { en el kernel")
+        raise ValueError("Could not find __global__ ...(...) { in the kernel")
     params = [p.strip() for p in m.group(1).split(",") if p.strip()]
     result = []
     for p in params:
@@ -322,84 +332,44 @@ def validate_args_match(kernel_name: str, source_text: str, yaml_args: list):
     real_sig = parse_kernel_signature(source_text)
     if len(real_sig) != len(yaml_args):
         raise ValueError(
-            f"'{kernel_name}': yaml declara {len(yaml_args)} args, "
-            f"la firma real tiene {len(real_sig)}"
+            f"'{kernel_name}': YAML declares {len(yaml_args)} args, "
+            f"actual signature has {len(real_sig)}"
         )
     for (real_type, real_name), decl in zip(real_sig, yaml_args):
         if real_name != decl["name"]:
             raise ValueError(
-                f"'{kernel_name}': orden/nombre no coincide -- yaml dice "
-                f"'{decl['name']}', firma real dice '{real_name}'"
+                f"'{kernel_name}': order/name mismatch -- YAML says "
+                f"'{decl['name']}', actual signature says '{real_name}'"
             )
         if decl["kind"] in ("in", "out") and "*" not in real_type:
             raise ValueError(
-                f"'{kernel_name}.{real_name}': yaml dice kind={decl['kind']} "
-                f"(deberia ser puntero) pero la firma real es '{real_type}'"
+                f"'{kernel_name}.{real_name}': YAML says kind={decl['kind']} "
+                f"(should be a pointer) but actual signature is '{real_type}'"
             )
         expected_scalar = {"int64": "int64_t", "int32": "int"}.get(decl.get("dtype", ""))
         if decl["kind"] == "scalar" and expected_scalar and expected_scalar not in real_type:
             raise ValueError(
-                f"'{kernel_name}.{real_name}': yaml declara dtype={decl['dtype']} "
-                f"pero la firma real es '{real_type}'"
+                f"'{kernel_name}.{real_name}': YAML declares dtype={decl['dtype']} "
+                f"but actual signature is '{real_type}'"
             )
-
-
-def parse_grid_spec(grid_field, block: list, dim_names: list) -> dict:
-    """Igual que antes, pero valida contra `dims:` del yaml en vez de
-    contra M/N/K fijos -- cualquier kernel puede nombrar sus propias
-    dimensiones."""
-    dims = {"x": "1", "y": "1", "z": "1"}
-    block_by_dim = {"x": block[0], "y": block[1], "z": block[2] if len(block) > 2 else 1}
-
-    if isinstance(grid_field, str):
-        grid_field = grid_field.strip()
-        name, _, inner = grid_field.partition("(")
-        name = name.strip()
-        if name not in GRID_HELPERS or not inner.endswith(")"):
-            raise ValueError(
-                f"grid: '{grid_field}' no reconocido. Usa uno de "
-                f"{list(GRID_HELPERS)}(...) o la forma explicita {{x: .., y: ..}}"
-            )
-        arg_names = [a.strip() for a in inner[:-1].split(",") if a.strip()]
-        target_dims = GRID_HELPERS[name]
-        if len(arg_names) != len(target_dims):
-            raise ValueError(
-                f"grid: '{grid_field}' espera {len(target_dims)} argumento(s), "
-                f"recibio {len(arg_names)}"
-            )
-        for var_name, dim in zip(arg_names, target_dims):
-            if var_name not in dim_names:
-                raise ValueError(
-                    f"grid: '{var_name}' no esta declarado en 'dims: {dim_names}' -- revisa {grid_field}"
-                )
-            dims[dim] = _ceildiv_expr(var_name, block_by_dim[dim])
-        return dims
-
-    if isinstance(grid_field, dict):
-        for dim in ("x", "y", "z"):
-            if dim in grid_field:
-                dims[dim] = str(grid_field[dim])
-        return dims
-
-    raise ValueError(f"grid: tipo no soportado ({type(grid_field).__name__}); usa string o dict")
 
 
 def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
                        dispatch_cpp_path: Path, dispatch_registry_header: Path):
-    """Escribe el .cpp de registro de dispatch. Ahora valida yaml vs
-    firma real ANTES de generar, y arma la lambda sobre DimMap en vez
-    de M,N,K posicionales fijos."""
+    """Writes the dispatch registration .cpp. Now validates YAML vs
+    actual signature BEFORE generating, and builds the lambda over
+    DimMap instead of fixed positional M,N,K."""
     if kernel_yaml.get("kernel", kernel_name) != kernel_name:
-        print(f"  [WARN] 'kernel:' en el yaml no coincide con el nombre de archivo "
+        print(f"  [WARN] 'kernel:' in YAML does not match the file name "
               f"({kernel_yaml.get('kernel')!r} vs {kernel_name!r})", file=sys.stderr)
 
     dim_names = kernel_yaml.get("dims")
     if not dim_names:
-        raise ValueError(f"'{kernel_name}.yaml' no define 'dims:' (ej. [M, N, K] o [n])")
+        raise ValueError(f"'{kernel_name}.yaml' does not define 'dims:' (e.g., [M, N, K] or [n])")
 
     yaml_args = kernel_yaml.get("args")
     if not yaml_args:
-        raise ValueError(f"'{kernel_name}.yaml' no define 'args:'")
+        raise ValueError(f"'{kernel_name}.yaml' does not define 'args:'")
 
     validate_args_match(kernel_name, source_text, yaml_args)
 
@@ -409,13 +379,13 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
     total_threads = block[0] * block[1] * block[2]
     if total_threads > 1024:
         raise ValueError(
-            f"'{kernel_name}.yaml': block {block} = {total_threads} threads/bloque, "
-            f"excede el maximo de 1024 de CUDA"
+            f"'{kernel_name}.yaml': block {block} = {total_threads} threads/block, "
+            f"exceeds CUDA maximum of 1024"
         )
 
     grid_field = kernel_yaml.get("grid")
     if grid_field is None:
-        raise ValueError(f"'{kernel_name}.yaml' no define 'grid'")
+        raise ValueError(f"'{kernel_name}.yaml' does not define 'grid'")
     grid = parse_grid_spec(grid_field, block, dim_names)
 
     shared_mem = int(kernel_yaml.get("shared_mem_bytes", 0))
@@ -427,8 +397,8 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
     dim_extract_lines = [f'    int64_t {name} = dims.at("{name}");' for name in dim_names]
 
     lines = [
-        "// AUTOGENERADO por scripts/compile_kernel.py -- NO EDITAR A MANO.",
-        f"// Regla de dispatch para '{kernel_name}', derivada de src/kernels/{kernel_name}.yaml",
+        "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
+        f"// Dispatch rule for '{kernel_name}', derived from src/kernels/{kernel_name}.yaml",
         f'#include "{registry_include}"',
         "",
         f"namespace yadrakova::kernels::dispatch_{kernel_name} {{",
@@ -459,35 +429,13 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
     dispatch_cpp_path.parent.mkdir(parents=True, exist_ok=True)
     dispatch_cpp_path.write_text("\n".join(lines), encoding="utf-8")
 
-import re
-
-def extract_kernel_name(cubin_stem: str, known_dtypes: set) -> str:
-    # Buscar el patrón "_{dtype}_" y tomar todo lo anterior como kernel_name
-    for dtype in known_dtypes:
-        marker = f"_{dtype}_"
-        if marker in cubin_stem:
-            return cubin_stem[:cubin_stem.index(marker)]
-    # fallback: split por "_" y confiar en que no haya dtype en el nombre (poco fiable)
-    return cubin_stem.split("_")[0]
-
-def prune_orphaned_kernels(cache_dir: Path, valid_kernel_names: set, known_dtypes: set):
-    if not cache_dir.exists():
-        return
-    removed = 0
-    for cubin in cache_dir.glob("*.cubin"):
-        kernel_name = extract_kernel_name(cubin.stem, known_dtypes)
-        if kernel_name not in valid_kernel_names:
-            cubin.unlink()
-            removed += 1
-    if removed:
-        print(f"[cache] {removed} .cubin huerfanos eliminados (kernel ya no existe)")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--output-dir", default=None,
-                        help="Override del directorio de salida para los .cpp de "
-                             "registro (usado por CMake para apuntar al build dir)")
+                        help="Override for the output directory of the registration "
+                             ".cpp files (used by CMake to point to the build dir)")
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -504,21 +452,20 @@ def main():
     ).resolve()
     cache_dir = Path(config["cache"]["dir"])
 
-    # Directorio de headers compartidos (common.cuh, etc.) -- mismo
-    # nivel que registry.hpp, usado tanto para -I de nvcc como para
-    # el hash de invalidacion.
+    # Shared headers directory (common.cuh, etc.) -- same level as
+    # registry.hpp, used both for nvcc -I and for the invalidation hash.
     shared_headers_dir = Path("include/kernels")
     include_dirs = [Path("include")]
 
     try:
         nvcc_ver = nvcc_version()
     except FileNotFoundError:
-        print("ERROR: nvcc no encontrado en PATH.", file=sys.stderr)
+        print("ERROR: nvcc not found in PATH.", file=sys.stderr)
         sys.exit(1)
 
     sources = sorted(src_dir.glob("*.cu"))
     if not sources:
-        print(f"No hay .cu en {src_dir}")
+        print(f"No .cu files in {src_dir}")
         return
 
     shared_headers_hash = hash_shared_headers(shared_headers_dir)
@@ -555,16 +502,16 @@ def main():
         print(f"  -> {cpp_path}")
 
         if kernel_yaml is None:
-            print(f"  [dispatch] sin {kernel_name}.yaml -- se omite ...")
+            print(f"  [dispatch] no {kernel_name}.yaml -- skipping ...")
         else:
             source_text = source.read_text(encoding="utf-8")
             dispatch_cpp_path = cpp_out_dir / f"{kernel_name}_dispatch.generated.cpp"
             write_dispatch_cpp(kernel_name, kernel_yaml, source_text, dispatch_cpp_path, dispatch_registry_header)
             print(f"  -> {dispatch_cpp_path}")
 
-    # Prune final: kernels renombrados/eliminados desde la ultima corrida.
+    # Final prune: kernels renamed/deleted since the last run.
     valid_names = {s.stem for s in sources}
-    prune_orphaned_kernels(cache_dir, valid_names, set(dtypes))  # dtypes es la lista de config
+    prune_orphaned_kernels(cache_dir, valid_names, set(dtypes))
 
 
 if __name__ == "__main__":

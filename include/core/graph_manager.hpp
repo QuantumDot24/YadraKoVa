@@ -18,7 +18,7 @@ namespace yadrakova::core
 
         Graph& get(const std::string& name);
 
-        bool has(const std::string& name) const;
+        [[nodiscard]] bool has(const std::string& name) const;
 
         Stream& stream_for(const std::string& name);
 
@@ -31,20 +31,21 @@ namespace yadrakova::core
 
         void synchronize_all();
 
-        size_t count() const { return graphs_.size(); }
-        size_t stream_count() const { return owned_streams_.size(); }
+        [[nodiscard]] size_t count() const { return graphs_.size(); }
+        [[nodiscard]] size_t stream_count() const { return owned_streams_.size(); }
 
-        MemoryPool& pool() { return pool_; }
+        [[nodiscard]] MemoryPool& pool() const { return pool_; }
         Telemetry& telemetry() { return telemetry_; }
-        const Telemetry& telemetry() const { return telemetry_; }
+        [[nodiscard]] const Telemetry& telemetry() const { return telemetry_; }
+
         template <typename F>
-         auto time(std::string label, OpKind kind, Stream& stream, F&& fn,
-                   bool from_graph_replay = false,
-                   uint64_t bytes_moved = 0, double gflops = 0.0)
-             -> decltype(fn())
+        auto time(std::string label, OpKind kind, Stream& stream, F&& fn,
+                  bool from_graph_replay = false,
+                  uint64_t bytes_moved = 0, double gflops = 0.0)
+            -> decltype(fn())
         {
             return telemetry_.time(std::move(label), kind, stream, std::forward<F>(fn),
-                                    from_graph_replay, bytes_moved, gflops);
+                                   from_graph_replay, bytes_moved, gflops);
         }
 
         template <typename F>
@@ -52,8 +53,9 @@ namespace yadrakova::core
                        int replays, F&& fn)
         {
             telemetry_.benchmark(std::move(group_label), ops_per_iteration, replays,
-                                  std::forward<F>(fn));
+                                 std::forward<F>(fn));
         }
+
     private:
         MemoryPool& pool_;
         std::unordered_map<std::string, std::unique_ptr<Graph>> graphs_;

@@ -6,7 +6,7 @@ find_package(PahoMqttCpp CONFIG REQUIRED)
 find_program(PYTHON3_EXECUTABLE NAMES python3 python REQUIRED)
 
 # ---------------------------------------------------------------------------
-# Estándares de lenguaje
+# Language standards
 # ---------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,7 +18,7 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 # ---------------------------------------------------------------------------
-# Auto-descubrimiento de fuentes e includes (todo lo que NO es autogenerado)
+# Auto-discovery of sources and includes (everything that is NOT auto-generated)
 # ---------------------------------------------------------------------------
 file(GLOB_RECURSE YADRAKOVA_CORE_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/core/*.cpp"
@@ -38,34 +38,34 @@ file(GLOB_RECURSE YADRAKOVA_TEST_SOURCES CONFIGURE_DEPENDS
 
 file(GLOB KERNEL_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.cu")
 
-# NUEVO: glob de los .yaml de dispatch, con CONFIGURE_DEPENDS -- si
-# agregas/quitas un .yaml, CMake tiene que reconfigurar, porque mas
-# abajo decidimos EN TIEMPO DE CONFIGURACION (con EXISTS) si ese
-# kernel tiene o no un *_dispatch.generated.cpp como output esperado.
-# Sin este glob, agregar un .yaml nuevo no dispararia reconfiguracion
-# y el build quedaria desactualizado hasta un cmake manual.
+# NEW: glob of dispatch .yaml files, with CONFIGURE_DEPENDS -- if
+# you add/remove a .yaml, CMake must reconfigure, because further
+# below we decide AT CONFIGURATION TIME (with EXISTS) whether that
+# kernel has a *_dispatch.generated.cpp as an expected output.
+# Without this glob, adding a new .yaml would not trigger a reconfiguration
+# and the build would remain stale until a manual cmake.
 file(GLOB_RECURSE KERNEL_YAML_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.yaml")
 
 # ---------------------------------------------------------------------------
-# Codegen de kernels -- OUTPUT explicito, NO glob, para los .cpp de
-# registro. CMake conoce los nombres de salida en tiempo de
-# configuracion (se derivan 1:1 de los .cu de entrada), asi que Ninja
-# los trata como dependencias reales sin importar timing/cache del
-# script Python. Esto elimina la carrera que causaba "no hay kernel
-# registrado" en builds subsecuentes.
+# Kernel codegen -- explicit OUTPUT, NOT glob, for the registration
+# .cpp files. CMake knows the output names at configuration time
+# (they are derived 1:1 from the input .cu files), so Ninja
+# treats them as real dependencies regardless of timing/cache of the
+# Python script. This eliminates the race that caused "no kernel
+# registered" in subsequent builds.
 #
-# Los .cuh (solo datos) SI pueden vivir en include/ y descubrirse por
-# glob normal, porque nadie los compila directamente -- solo se
-# incluyen. El problema de la carrera solo aplica a unidades de
-# compilacion reales (.cpp), no a headers.
+# The .cuh files (data only) CAN live in include/ and be discovered by
+# normal glob, because nobody compiles them directly -- they are just
+# included. The race problem only applies to real compilation
+# units (.cpp), not to headers.
 #
-# NUEVO: ademas de "{kernel}_registration.cpp" (siempre), agregamos
-# "{kernel}_dispatch.generated.cpp" SOLO si existe un
-# src/kernels/{kernel}.yaml -- migracion incremental, kernel por
-# kernel. compile_kernel.py hace exactamente esta misma verificacion
-# (find_dispatch_yaml) del lado de Python; aqui la replicamos del
-# lado de CMake porque el custom_command necesita declarar sus
-# OUTPUT de antemano, en tiempo de configuracion.
+# NEW: in addition to "{kernel}_registration.cpp" (always), we add
+# "{kernel}_dispatch.generated.cpp" ONLY if a
+# src/kernels/{kernel}.yaml exists -- incremental migration, kernel by
+# kernel. compile_kernel.py does exactly this same check
+# (find_dispatch_yaml) on the Python side; here we replicate it on
+# the CMake side because the custom_command needs to declare its
+# OUTPUT in advance, at configuration time.
 # ---------------------------------------------------------------------------
 set(KERNEL_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/kernels")
 set(KERNEL_GENERATED_SOURCES "")
@@ -79,7 +79,7 @@ foreach(kernel_src ${KERNEL_SOURCES})
     if(EXISTS "${kernel_dir}/${kernel_name}.yaml")
         list(APPEND KERNEL_GENERATED_SOURCES "${KERNEL_GENERATED_DIR}/${kernel_name}_dispatch.generated.cpp")
     else()
-        message(STATUS "YadraKoVa -- '${kernel_name}' sin .yaml de dispatch, aun no migrado")
+        message(STATUS "YadraKoVa -- '${kernel_name}' without dispatch .yaml, not yet migrated")
     endif()
 endforeach()
 
@@ -93,12 +93,12 @@ add_custom_command(
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         DEPENDS ${KERNEL_SOURCES} ${KERNEL_YAML_FILES} ${SHARED_KERNEL_HEADERS}
         ${CMAKE_SOURCE_DIR}/scripts/compile_kernel.py ${CMAKE_SOURCE_DIR}/config.yaml
-        COMMENT "Compilando kernels y generando registro + dispatch (.cu/.yaml -> .cubin -> .cuh + .cpp)"
+        COMMENT "Compiling kernels and generating registration + dispatch (.cu/.yaml -> .cubin -> .cuh + .cpp)"
         VERBATIM
 )
 
 # ---------------------------------------------------------------------------
-# Libreria nucleo
+# Core library
 # ---------------------------------------------------------------------------
 add_library(yadrakova_core STATIC
         ${YADRAKOVA_CORE_SOURCES}
@@ -121,13 +121,13 @@ target_link_libraries(yadrakova_core PUBLIC
 )
 
 # ---------------------------------------------------------------------------
-# Tests -- un ejecutable por archivo en tests/. /WHOLEARCHIVE es
-# necesario porque los .cpp de registro (tanto KernelRegistry como,
-# ahora, DispatchRegistry) no exportan simbolos que nadie llama
-# directamente -- sin esto, el linker los descarta de
-# yadrakova_core.lib por "no usados", y el registro estatico nunca se
-# ejecuta (efecto: "no hay kernel registrado para X" o "no hay regla
-# de dispatch registrada para X" en runtime, con el build en verde).
+# Tests -- one executable per file in tests/. /WHOLEARCHIVE is
+# necessary because the registration .cpp files (both KernelRegistry and,
+# now, DispatchRegistry) don't export symbols that anyone calls
+# directly -- without this, the linker discards them from
+# yadrakova_core.lib as "unused", and the static registration never
+# runs (effect: "no kernel registered for X" or "no dispatch rule
+# registered for X" at runtime, with a clean build).
 # ---------------------------------------------------------------------------
 enable_testing()
 
@@ -135,7 +135,6 @@ foreach(test_src ${YADRAKOVA_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
     target_link_libraries(${test_name} PRIVATE yadrakova_core)
-    # NUEVO: cuBLAS para tests de matmul que usen cublas_gemm_bf16
     target_link_libraries(${test_name} PRIVATE CUDA::cublas)
     if(MSVC)
         target_link_options(${test_name} PRIVATE "/WHOLEARCHIVE:yadrakova_core")
@@ -150,21 +149,21 @@ foreach(test_src ${YADRAKOVA_TEST_SOURCES})
 endforeach()
 
 # ---------------------------------------------------------------------------
-# Diagnostico
+# Diagnostics
 # ---------------------------------------------------------------------------
-message(STATUS "YadraKoVa -- fuentes del core detectadas:")
+message(STATUS "YadraKoVa -- core sources detected:")
 foreach(src ${YADRAKOVA_CORE_SOURCES})
     message(STATUS "  ${src}")
 endforeach()
-message(STATUS "YadraKoVa -- kernels .cu detectados:")
+message(STATUS "YadraKoVa -- .cu kernels detected:")
 foreach(src ${KERNEL_SOURCES})
     message(STATUS "  ${src}")
 endforeach()
-message(STATUS "YadraKoVa -- .cpp generados (registro + dispatch, OUTPUT explicito):")
+message(STATUS "YadraKoVa -- generated .cpp (registration + dispatch, explicit OUTPUT):")
 foreach(src ${KERNEL_GENERATED_SOURCES})
     message(STATUS "  ${src}")
 endforeach()
-message(STATUS "YadraKoVa -- tests detectados:")
+message(STATUS "YadraKoVa -- tests detected:")
 foreach(src ${YADRAKOVA_TEST_SOURCES})
     message(STATUS "  ${src}")
 endforeach()

@@ -1,5 +1,4 @@
-// GELU elementwise -- un thread por elemento. Usa to_float/from_float
-// de common.cuh para no repetir la logica de conversion de dtype.
+// GELU
 #include "../../include/kernels/common.cuh"
 #ifndef KERNEL_DTYPE
 #define KERNEL_DTYPE float

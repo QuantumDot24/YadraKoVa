@@ -4,11 +4,11 @@ namespace yadrakova::core {
 
     enum class OpKind {
         Gemm,
-        Gemv,          // <--- Nuevo
+        Gemv,
         Elementwise,
         Reduction,
-        Attention,     // <--- Nuevo
-        Conv2D,        // <--- Nuevo
+        Attention,
+        Conv2D,
         GraphReplay,
         Memcpy,
         Other

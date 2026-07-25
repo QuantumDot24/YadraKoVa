@@ -120,7 +120,7 @@ void test_tensor_async_transfer() {
 
     HostBuffer<float> dst(n);
     t.to_host_async(dst, stream);
-    stream.synchronize(); // sin esto, leer dst antes de tiempo seria UB
+    stream.synchronize();
 
     for (size_t i = 0; i < n; ++i) {
         assert(dst[i] == src[i]);
@@ -130,9 +130,6 @@ void test_tensor_async_transfer() {
 }
 
 void test_non_contiguous_transfer_throws() {
-    // transpose() produce una view valida para computo, pero NO para un
-    // memcpy plano -- to_host() sobre ella debe rechazar explicitamente,
-    // no copiar datos incorrectos en silencio.
     MemoryPool pool(0);
     Tensor<float> t({64, 64}, pool);
     Tensor<float> view = t.transpose(0, 1);

@@ -3,9 +3,10 @@
 #include "core/memory.hpp"
 #include <string>
 
-namespace yadrakova::core {
-
-    class Graph {
+namespace yadrakova::core
+{
+    class Graph
+    {
     public:
         explicit Graph(std::string name);
         ~Graph();
@@ -19,8 +20,8 @@ namespace yadrakova::core {
         void update_from(Graph& new_topology);
         void abort_capture(Stream& stream) noexcept;
 
-        const std::string& name() const { return name_; }
-        bool is_instantiated() const { return graph_exec_ != nullptr; }
+        [[nodiscard]] const std::string& name() const { return name_; }
+        [[nodiscard]] bool is_instantiated() const { return graph_exec_ != nullptr; }
 
     private:
         void instantiate();
@@ -33,5 +34,4 @@ namespace yadrakova::core {
         MemoryPool* pool_ = nullptr;
         size_t bytes_reserved_before_ = 0;
     };
-
 } // namespace yadrakova::core

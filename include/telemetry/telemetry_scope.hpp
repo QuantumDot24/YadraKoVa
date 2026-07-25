@@ -3,13 +3,10 @@
 #include <cuda_runtime.h>
 #include "core/stream.hpp"
 
-namespace yadrakova::core {
-
-    // RAII: al construirse encola un evento CUDA de inicio en el stream dado;
-    // al destruirse encola el de fin. NO sincroniza en ningun punto -- el
-    // hot path solo paga 2 cudaEventRecord async. Los tiempos reales se
-    // resuelven despues, todos juntos, con Telemetry::resolve_pending().
-    class TelemetryScope {
+namespace yadrakova::core
+{
+    class TelemetryScope
+    {
     public:
         TelemetryScope(Telemetry* telemetry, std::string label, OpKind kind,
                        cudaStream_t stream, const void* stream_hint = nullptr,
@@ -19,13 +16,16 @@ namespace yadrakova::core {
               stream_hint_(stream_hint), from_graph_replay_(from_graph_replay),
               bytes_moved_(bytes_moved), gflops_(gflops)
         {
-            if (telemetry_) {
+            if (telemetry_)
+            {
                 handle_ = telemetry_->begin_async(stream);
             }
         }
 
-        ~TelemetryScope() {
-            if (telemetry_) {
+        ~TelemetryScope()
+        {
+            if (telemetry_)
+            {
                 telemetry_->end_async(handle_, label_, kind_, stream_hint_,
                                       from_graph_replay_, bytes_moved_, gflops_);
             }
@@ -44,14 +44,14 @@ namespace yadrakova::core {
         double gflops_;
         size_t handle_ = 0;
     };
+
     template <typename F>
-     auto Telemetry::time(std::string label, OpKind kind, Stream& stream, F&& fn,
-                            bool from_graph_replay, uint64_t bytes_moved, double gflops)
-         -> decltype(fn())
+    auto Telemetry::time(std::string label, OpKind kind, Stream& stream, F&& fn,
+                         bool from_graph_replay, uint64_t bytes_moved, double gflops)
+        -> decltype(fn())
     {
         TelemetryScope scope(this, std::move(label), kind, stream.raw(), &stream,
-                              from_graph_replay, bytes_moved, gflops);
+                             from_graph_replay, bytes_moved, gflops);
         return fn();
     }
-
 } // namespace yadrakova::core

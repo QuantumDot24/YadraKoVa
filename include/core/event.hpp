@@ -1,11 +1,11 @@
-// event.hpp
 #pragma once
 #include "core/stream.hpp"
 #include <cuda_runtime.h>
 
-namespace yadrakova::core {
-
-    class Event {
+namespace yadrakova::core
+{
+    class Event
+    {
     public:
         explicit Event(bool timing = true);
         ~Event();
@@ -28,7 +28,8 @@ namespace yadrakova::core {
     float elapsed_ms(const Event& start, const Event& end);
 
     template <typename Fn>
-    float time_kernel_ms(Stream& stream, Fn&& fn) {
+    float time_kernel_ms(Stream& stream, Fn&& fn)
+    {
         Event start(true), end(true);
         start.record(stream);
         fn();
@@ -36,5 +37,4 @@ namespace yadrakova::core {
         end.synchronize();
         return elapsed_ms(start, end);
     }
-
 } // namespace yadrakova::core

@@ -1,24 +1,28 @@
-// stream.cpp
 #include "core/stream.hpp"
 #include "core/cuda_error.hpp"
 
-namespace yadrakova::core {
-
-    Stream::Stream(bool non_blocking) {
-        unsigned int flags = non_blocking ? cudaStreamNonBlocking : cudaStreamDefault;
+namespace yadrakova::core
+{
+    Stream::Stream(const bool non_blocking)
+    {
+        const unsigned int flags = non_blocking ? cudaStreamNonBlocking : cudaStreamDefault;
         CUDA_CHECK(cudaStreamCreateWithFlags(&handle_, flags));
     }
 
-    Stream::~Stream() {
+    Stream::~Stream()
+    {
         if (handle_) cudaStreamDestroy(handle_);
     }
 
-    Stream::Stream(Stream&& other) noexcept : handle_(other.handle_) {
+    Stream::Stream(Stream&& other) noexcept : handle_(other.handle_)
+    {
         other.handle_ = nullptr;
     }
 
-    Stream& Stream::operator=(Stream&& other) noexcept {
-        if (this != &other) {
+    Stream& Stream::operator=(Stream&& other) noexcept
+    {
+        if (this != &other)
+        {
             if (handle_) cudaStreamDestroy(handle_);
             handle_ = other.handle_;
             other.handle_ = nullptr;
@@ -26,11 +30,13 @@ namespace yadrakova::core {
         return *this;
     }
 
-    void Stream::synchronize() const {
+    void Stream::synchronize() const
+    {
         CUDA_CHECK(cudaStreamSynchronize(handle_));
     }
 
-    bool Stream::is_done() const {
+    bool Stream::is_done() const
+    {
         cudaError_t err = cudaStreamQuery(handle_);
         if (err == cudaSuccess) return true;
         if (err == cudaErrorNotReady) return false;
@@ -38,9 +44,9 @@ namespace yadrakova::core {
         return false;
     }
 
-    Stream& default_stream() {
+    Stream& default_stream()
+    {
         static Stream instance(/*non_blocking=*/true);
         return instance;
     }
-
 } // namespace yadrakova::core

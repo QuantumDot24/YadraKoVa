@@ -8,8 +8,6 @@
 
 namespace yadrakova::kernels::common {
 
-// --- Conversion generica T <-> float, para acumular con precision
-//     sin importar el KERNEL_DTYPE del kernel que la use. ---
 
 template <typename T>
 __device__ __forceinline__ float to_float(T v) { return float(v); }
@@ -51,10 +49,6 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
         val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     return val;
 }
-
-// --- GELUGELU super GELU exacto (usando erf), no la aproximacion tanh. Compartida
-//     porque tanto el kernel de activacion standalone como (mas
-//     adelante) el forward de una capa fused la van a necesitar. ---
 
 __device__ __forceinline__ float gelu_exact(float x) {
     return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f)); // 1/sqrt(2)

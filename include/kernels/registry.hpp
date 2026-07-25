@@ -43,7 +43,7 @@ namespace yadrakova::kernels
             auto bin_it = binaries_.find(k);
             if (bin_it == binaries_.end())
             {
-                throw std::runtime_error("KernelRegistry: no hay cubin registrado para '" + k + "'");
+                throw std::runtime_error("KernelRegistry: no cubin registered for '" + k + "'");
             }
 
             static bool cu_init_done = false;
@@ -57,12 +57,12 @@ namespace yadrakova::kernels
             CUresult err = cuModuleLoadData(&entry.module, bin_it->second.data);
             if (err != CUDA_SUCCESS)
             {
-                throw std::runtime_error("cuModuleLoadData fallo para '" + k + "'");
+                throw std::runtime_error("cuModuleLoadData failed for '" + k + "'");
             }
             err = cuModuleGetFunction(&entry.function, entry.module, (name + "_kernel").c_str());
             if (err != CUDA_SUCCESS)
             {
-                throw std::runtime_error("cuModuleGetFunction fallo para '" + k + "'");
+                throw std::runtime_error("cuModuleGetFunction failed for '" + k + "'");
             }
 
             loaded_[k] = entry;

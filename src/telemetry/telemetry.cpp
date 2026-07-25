@@ -1,4 +1,3 @@
-// telemetry.cpp
 #include "telemetry/telemetry.hpp"
 #include <sstream>
 #include <iomanip>
@@ -178,8 +177,6 @@ namespace yadrakova::core
                     cudaGetErrorString(err));
             }
 
-            // record() ya NO debe usar current_group_label_ (está obsoleto para
-            // esta ruta async) -- ahora recibe el grupo ya congelado en p.group_label.
             record_with_group(std::move(p.label), p.op_kind, ms, p.stream_hint,
                               p.from_graph_replay, p.group_label,
                               p.bytes_moved, p.gflops);
@@ -224,7 +221,7 @@ namespace yadrakova::core
         }
     } // namespace
 
-    std::string Telemetry::to_json_line(const TelemetryRecord& r) const
+    std::string Telemetry::to_json_line(const TelemetryRecord& r)
     {
         std::ostringstream os;
         os << std::setprecision(6) << std::fixed;

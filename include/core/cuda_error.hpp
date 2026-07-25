@@ -48,8 +48,5 @@ inline void cu_check(CUresult err, const char* expr, const char* file, int line,
 
 #define CUDA_CHECK(expr) ::yadrakova::core::cuda_check((expr), #expr, __FILE__, __LINE__)
 #define CU_CHECK(expr)   ::yadrakova::core::cu_check((expr), #expr, __FILE__, __LINE__)
-
-// Variantes con contexto -- para cuando el mensaje generico no basta
-// (ej: "Graph 'backward_step': cudaGraphLaunch fallo...").
 #define CUDA_CHECK_CTX(expr, ctx) ::yadrakova::core::cuda_check((expr), #expr, __FILE__, __LINE__, (ctx))
 #define CU_CHECK_CTX(expr, ctx)   ::yadrakova::core::cu_check((expr), #expr, __FILE__, __LINE__, (ctx))

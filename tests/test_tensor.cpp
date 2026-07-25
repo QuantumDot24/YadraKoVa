@@ -4,68 +4,75 @@
 
 using namespace yadrakova::core;
 
-void test_contiguous_alloc() {
+void test_contiguous_alloc()
+{
     Tensor<float> t({2, 3, 4});
     assert(t.numel() == 24);
     assert(t.is_contiguous());
     std::cout << "[OK] contiguous_alloc\n";
 }
 
-static void test_transpose_no_copy() {
+static void test_transpose_no_copy()
+{
     Tensor<float> t({2, 3, 4});
     const float* original_ptr = t.data();
     Tensor<float> tt = t.transpose(0, 1);
-    assert(tt.data() == original_ptr);          // mismo buffer, cero copia
+    assert(tt.data() == original_ptr);
     assert(tt.shape()[0] == 3 && tt.shape()[1] == 2);
-    assert(!tt.is_contiguous());                // transpose rompe contigüidad, es esperado
+    assert(!tt.is_contiguous());
     std::cout << "[OK] transpose_no_copy\n";
 }
 
-void test_slice_offset() {
+void test_slice_offset()
+{
     Tensor<float> t({4, 8});
-    Tensor<float> s = t.slice(0, 1, 2);          // filas [1,3)
+    Tensor<float> s = t.slice(0, 1, 2);
     assert(s.shape()[0] == 2 && s.shape()[1] == 8);
-    assert(s.data() == t.data() + 8);            // offset correcto, mismo buffer
+    assert(s.data() == t.data() + 8);
     std::cout << "[OK] slice_offset\n";
 }
 
-void test_reshape_throws_on_noncontiguous() {
+void test_reshape_throws_on_noncontiguous()
+{
     Tensor<float> t({2, 3});
     Tensor<float> tt = t.transpose(0, 1);
     bool threw = false;
-    try {
+    try
+    {
         tt.reshape({6});
-    } catch (const std::runtime_error&) {
+    }
+    catch (const std::runtime_error&)
+    {
         threw = true;
     }
     assert(threw);
     std::cout << "[OK] reshape_throws_on_noncontiguous\n";
 }
-void test_pool_outlives_tensor() {
-    // Simula el escenario peligroso: el pool "muere" (sale de scope)
-    // ANTES que un tensor que sigue usando su memoria.
+
+void test_pool_outlives_tensor()
+{
     std::shared_ptr<Tensor<float>> surviving_tensor;
     {
         MemoryPool local_pool(0);
         surviving_tensor = std::make_shared<Tensor<float>>(Shape{4, 4}, local_pool);
         assert(local_pool.outstanding_buffers() == 1);
-    } // local_pool sale de scope aqui -- SIN el fix esto seria un crash
+    }
 
-    // El tensor sigue siendo completamente valido: su Impl sigue vivo
-    // gracias al shared_ptr capturado en el deleter.
+
     assert(surviving_tensor->numel() == 16);
     assert(surviving_tensor->data() != nullptr);
 
-    // Escribimos algo a la memoria para probar que de verdad sigue mapeada
     cudaMemset(surviving_tensor->data(), 0, surviving_tensor->numel() * sizeof(float));
     cudaError_t err = cudaGetLastError();
     assert(err == cudaSuccess);
 
     std::cout << "[OK] pool_outlives_tensor (memoria real sigue viva tras destruir el pool)\n";
 
-    surviving_tensor.reset(); // ahora si se libera todo, de verdad
+    surviving_tensor.reset();
 }
-int main() {
+
+int main()
+{
     test_contiguous_alloc();
     test_transpose_no_copy();
     test_slice_offset();

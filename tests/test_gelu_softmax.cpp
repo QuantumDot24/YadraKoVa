@@ -7,7 +7,6 @@
 
 using namespace yadrakova::core;
 
-// Referencias CPU -- fuente de verdad.
 float cpu_gelu(float x) {
     return 0.5f * x * (1.0f + std::erf(x * 0.70710678118654752440f));
 }
@@ -43,7 +42,7 @@ void test_gelu_correctness() {
 }
 
 void test_softmax_correctness() {
-    const int rows = 4, cols = 16; // cols <= 32 para esta version simple
+    const int rows = 4, cols = 16;
 
     Tensor<float> A = Tensor<float>::randn({rows, cols});
     Tensor<float> C = A.softmax();

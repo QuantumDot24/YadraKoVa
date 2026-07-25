@@ -1,5 +1,4 @@
 #include "core/device.hpp"
-
 #include <cuda_runtime.h>
 #include <stdexcept>
 
@@ -16,7 +15,7 @@ namespace yadrakova::core {
         cudaError_t err = cudaGetDeviceProperties(&props, device_id);
         if (err != cudaSuccess) {
             throw std::runtime_error(
-                "Device: cudaGetDeviceProperties fallo: " +
+                "Device: cudaGetDeviceProperties failed: " +
                 std::string(cudaGetErrorString(err)));
         }
 
@@ -38,11 +37,11 @@ namespace yadrakova::core {
         case 100: return kernels::Arch::SM_100;
         default:
             throw std::runtime_error(
-                "Device: esta GPU es sm_" + std::to_string(cc) +
-                ", no hay un kernels::Arch mapeado para ella. Si quieres "
-                "soportarla: (1) agrega el caso a Device::map_arch, "
-                "(2) agrega el valor al enum kernels::Arch, "
-                "(3) agrega la arquitectura a config.yaml y recompila los kernels.");
+                "Device: this GPU is sm_" + std::to_string(cc) +
+                ", no kernels::Arch mapped for it. If you want to "
+                "support it: (1) add the case to Device::map_arch, "
+                "(2) add the value to the kernels::Arch enum, "
+                "(3) add the architecture to config.yaml and recompile the kernels.");
         }
     }
 

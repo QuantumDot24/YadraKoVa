@@ -6,11 +6,11 @@
 
 using namespace yadrakova::core;
 
-void test_basic_capture_and_launch() {
+void test_basic_capture_and_launch()
+{
     Stream stream;
     MemoryPool pool(0);
 
-    // Preasignamos ANTES de capturar -- regla de oro.
     Tensor<float> t({1024, 1024}, pool);
 
     Graph g("simple_memset");
@@ -24,39 +24,47 @@ void test_basic_capture_and_launch() {
 
     std::cout << "[OK] basic_capture_and_launch\n";
 }
-void test_graph_manager_capture_cleans_up_on_exception() {
+
+void test_graph_manager_capture_cleans_up_on_exception()
+{
     GraphManager manager;
 
     bool threw = false;
-    try {
-        manager.capture("bad_capture", /*strict=*/true, [&]() {
-            // Fuerza un cudaMalloc durante captura -- debe lanzar.
+    try
+    {
+        manager.capture("bad_capture", /*strict=*/true, [&]()
+        {
             Tensor<float> t({256, 256}, manager.pool());
         });
-    } catch (const std::runtime_error&) {
+    }
+    catch (const std::runtime_error&)
+    {
         threw = true;
     }
     assert(threw);
 
-    // El Graph debe poder reintentarse limpio despues del abort --
-    // si abort_capture() no se hubiera llamado, este segundo intento
-    // fallaria con "ya hay una captura en progreso".
-    Tensor<float> t_pre({256, 256}, manager.pool()); // preasignada correctamente
+    Tensor<float> t_pre({256, 256}, manager.pool());
 
     bool second_attempt_ok = true;
-    try {
-        manager.capture("bad_capture", true, [&]() {
+    try
+    {
+        manager.capture("bad_capture", true, [&]()
+        {
             cudaMemsetAsync(t_pre.data(), 0, t_pre.numel() * sizeof(float),
-                             manager.stream_for("bad_capture").raw());
+                            manager.stream_for("bad_capture").raw());
         });
-    } catch (...) {
+    }
+    catch (...)
+    {
         second_attempt_ok = false;
     }
     assert(second_attempt_ok);
 
     std::cout << "[OK] graph_manager_capture_cleans_up_on_exception\n";
 }
-void test_strict_mode_catches_allocation_during_capture() {
+
+void test_strict_mode_catches_allocation_during_capture()
+{
     Stream stream;
     MemoryPool pool(0);
 
@@ -64,23 +72,23 @@ void test_strict_mode_catches_allocation_during_capture() {
     g.begin_capture(stream, pool, /*strict=*/true);
 
     bool threw = false;
-    try {
-        // ERROR INTENCIONAL: CUDA mismo prohibe cudaMalloc durante
-        // una captura activa -- esto lanza ANTES de llegar a
-        // end_capture(), no despues.
+    try
+    {
+        // INTENTIONAL ERROR: CUDA itself prohibits cudaMalloc during
+        // an active capture -- this throws BEFORE reaching
+        // end_capture(), not after.
         Tensor<float> t_created_mid_capture({512, 512}, pool);
         cudaMemsetAsync(t_created_mid_capture.data(), 0,
-                         t_created_mid_capture.numel() * sizeof(float), stream.raw());
-    } catch (const std::runtime_error& e) {
+                        t_created_mid_capture.numel() * sizeof(float), stream.raw());
+    }
+    catch (const std::runtime_error& e)
+    {
         threw = true;
-        std::cout << "  (excepcion esperada al intentar allocar: " << e.what() << ")\n";
+        std::cout << "  (expected exception when trying to allocate: " << e.what() << ")\n";
         g.abort_capture(stream);
     }
     assert(threw);
 
-    // La captura quedo "colgada" (begin_capture ya se llamo, nunca
-    // se llamo end_capture exitosamente) -- hay que cerrarla para
-    // no dejar el stream en un estado invalido para el resto del programa.
     cudaGraph_t dangling_graph = nullptr;
     cudaStreamEndCapture(stream.raw(), &dangling_graph);
     if (dangling_graph) cudaGraphDestroy(dangling_graph);
@@ -88,7 +96,8 @@ void test_strict_mode_catches_allocation_during_capture() {
     std::cout << "[OK] strict_mode_catches_allocation_during_capture\n";
 }
 
-void test_graph_manager_multiple_named_graphs() {
+void test_graph_manager_multiple_named_graphs()
+{
     Stream stream;
     MemoryPool pool(0);
 
@@ -111,7 +120,6 @@ void test_graph_manager_multiple_named_graphs() {
     assert(manager.has("G_forward"));
     assert(manager.has("D_forward"));
 
-    // Simula alternancia GAN: 2 pasos de D por cada paso de G.
     manager.launch("D_forward", stream);
     manager.launch("D_forward", stream);
     manager.launch("G_forward", stream);
@@ -120,11 +128,12 @@ void test_graph_manager_multiple_named_graphs() {
     std::cout << "[OK] graph_manager_multiple_named_graphs\n";
 }
 
-int main() {
+int main()
+{
     test_basic_capture_and_launch();
     test_strict_mode_catches_allocation_during_capture();
     test_graph_manager_multiple_named_graphs();
     test_graph_manager_capture_cleans_up_on_exception();
-    std::cout << "Todos los tests de graph pasaron.\n";
+    std::cout << "All graph tests passed.\n";
     return 0;
 }

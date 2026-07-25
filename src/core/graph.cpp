@@ -12,7 +12,7 @@ Graph::~Graph() {
 
 void Graph::begin_capture(Stream& stream, MemoryPool& pool, bool strict) {
     if (capturing_) {
-        throw std::runtime_error("Graph '" + name_ + "': ya hay una captura en progreso.");
+        throw std::runtime_error("Graph '" + name_ + "': a capture is already in progress.");
     }
     strict_ = strict;
     pool_ = &pool;
@@ -25,7 +25,7 @@ void Graph::begin_capture(Stream& stream, MemoryPool& pool, bool strict) {
 
 void Graph::end_capture(Stream& stream) {
     if (!capturing_) {
-        throw std::runtime_error("Graph '" + name_ + "': no hay captura en progreso para cerrar.");
+        throw std::runtime_error("Graph '" + name_ + "': no capture in progress to end.");
     }
     if (graph_) {
         cudaGraphDestroy(graph_);
@@ -39,10 +39,10 @@ void Graph::end_capture(Stream& stream) {
         size_t bytes_after = pool_->bytes_reserved();
         if (bytes_after != bytes_reserved_before_) {
             throw std::runtime_error(
-                "Graph '" + name_ + "': el MemoryPool crecio de " +
-                std::to_string(bytes_reserved_before_) + " a " +
+                "Graph '" + name_ + "': MemoryPool grew from " +
+                std::to_string(bytes_reserved_before_) + " to " +
                 std::to_string(bytes_after) +
-                " bytes DURANTE la captura. Preasigna toda la memoria antes de begin_capture().");
+                " bytes DURING capture. Pre-allocate all memory before begin_capture().");
         }
     }
     instantiate();
@@ -50,7 +50,7 @@ void Graph::end_capture(Stream& stream) {
 
 void Graph::launch(Stream& stream) {
     if (!graph_exec_) {
-        throw std::runtime_error("Graph '" + name_ + "': no instanciado, llama end_capture() primero.");
+        throw std::runtime_error("Graph '" + name_ + "': not instantiated, call end_capture() first.");
     }
     CUDA_CHECK_CTX(cudaGraphLaunch(graph_exec_, stream.raw()), "Graph '" + name_ + "'");
 }
@@ -59,7 +59,7 @@ void Graph::update_from(Graph& new_topology) {
     cudaGraphExecUpdateResultInfo result_info{};
     CUDA_CHECK_CTX(
         cudaGraphExecUpdate(graph_exec_, new_topology.graph_, &result_info),
-        "Graph '" + name_ + "': cudaGraphExecUpdate fallo (topologia probablemente cambio)");
+        "Graph '" + name_ + "': cudaGraphExecUpdate failed (topology likely changed)");
 }
 
 void Graph::abort_capture(Stream& stream) noexcept {

@@ -9,15 +9,16 @@
 #include <vector>
 #include "device.hpp"
 
-namespace yadrakova::core {
-
-    class Executor {
+namespace yadrakova::core
+{
+    class Executor
+    {
     public:
         template <typename T>
-  static void execute(const std::string& kernel_name,
-                      const DimMap& dims,
-                      const std::vector<void*>& args,
-                      Stream& stream)
+        static void execute(const std::string& kernel_name,
+                            const DimMap& dims,
+                            const std::vector<void*>& args,
+                            Stream& stream)
         {
             DType dtype = dtype_traits<T>::value;
 
@@ -27,13 +28,12 @@ namespace yadrakova::core {
             DispatchDims d = DispatchRegistry::instance().get_dims(kernel_name, dims);
 
             CU_CHECK(cuLaunchKernel(fn,
-                                     d.grid.x,  d.grid.y,  d.grid.z,
-                                     d.block.x, d.block.y, d.block.z,
-                                     d.shared_mem_bytes,
-                                     stream.raw(),
-                                     const_cast<void**>(args.data()),
-                                     nullptr));
+                d.grid.x, d.grid.y, d.grid.z,
+                d.block.x, d.block.y, d.block.z,
+                d.shared_mem_bytes,
+                stream.raw(),
+                const_cast<void**>(args.data()),
+                nullptr));
         }
     };
-
 } // namespace yadrakova::core

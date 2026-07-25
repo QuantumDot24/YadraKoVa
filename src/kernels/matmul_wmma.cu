@@ -16,24 +16,20 @@ constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
-// Tile sizes – TILE_K aumentado a 32 para mayor intensidad aritmética
 constexpr int TILE_M = 128;
 constexpr int TILE_N = 64;
-constexpr int TILE_K = 32;          // <-- antes 16
+constexpr int TILE_K = 32;
 
 constexpr int WARPS_M = 4;
 constexpr int WARPS_N = 2;
-constexpr int THREADS_PER_BLOCK = WARPS_M * WARPS_N * 32; // 256 hilos
+constexpr int THREADS_PER_BLOCK = WARPS_M * WARPS_N * 32;
 
-// Padding para evitar bank conflicts (múltiplo de 8 elementos = 16 bytes)
 constexpr int SHMEM_PAD = 8;
-constexpr int AS_STRIDE = TILE_K + SHMEM_PAD;   // 32+8 = 40
-constexpr int BS_STRIDE = TILE_N + SHMEM_PAD;   // 64+8 = 72
+constexpr int AS_STRIDE = TILE_K + SHMEM_PAD;
+constexpr int BS_STRIDE = TILE_N + SHMEM_PAD;
 
-// Doble buffer (2 etapas) – equilibra latencia y uso de shared memory
 constexpr int STAGES = 2;
 
-// Copia asíncrona de 16 bytes, versión segura para SM < 8.0
 __device__ __forceinline__ void copy_16bytes_async(void* smem_ptr, const void* gmem_ptr, bool valid) {
 #if __CUDA_ARCH__ >= 800
     uint32_t smem_int_ptr = __cvta_generic_to_shared(smem_ptr);
@@ -59,7 +55,6 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
     HalfT* __restrict__ C,
     int64_t M, int64_t N, int64_t K)
 {
-    // --- L2 CACHE SWIZZLING (GRID REORDERING) ---
     constexpr int GROUP_SIZE_M = 8;
     const int grid_m = gridDim.y;
     const int grid_n = gridDim.x;
@@ -78,9 +73,6 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
     const int64_t block_row = final_block_m * TILE_M;
     const int64_t block_col = final_block_n * TILE_N;
 
-    // --- SHARED MEMORY OPTIMIZADA ---
-    // El buffer de salida ahora es float[TILE_M][TILE_N] (sin padding) para ahorrar espacio.
-    // Así caben TILE_K=32 y 2 etapas en los 64 KB de shared memory.
     union SharedStorage {
         struct {
             alignas(16) HalfT As[STAGES][TILE_M][AS_STRIDE]; // 2*128*40*2 = 20480 B
@@ -109,13 +101,11 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
         }
     }
 
-    constexpr int VEC_ELEMS = 8;                               // 16 bytes por vector
+    constexpr int VEC_ELEMS = 8;
     constexpr int A_VEC_TOTAL = (TILE_M * TILE_K) / VEC_ELEMS; // 128*32/8 = 512
     constexpr int B_VEC_TOTAL = (TILE_K * TILE_N) / VEC_ELEMS; //  32*64/8 = 256
 
-    // Lambda para cargar un tile completo en una etapa del pipeline
     auto load_tile_async = [&](int stage, int64_t k_offset) {
-        // Cargar A (MxK, row-major)
         #pragma unroll
         for (int i = tid; i < A_VEC_TOTAL; i += THREADS_PER_BLOCK) {
             int elem_idx = i * VEC_ELEMS;
@@ -131,7 +121,6 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
             copy_16bytes_async(smem_ptr, gmem_ptr, valid);
         }
 
-        // Cargar B (KxN, row-major)
         #pragma unroll
         for (int i = tid; i < B_VEC_TOTAL; i += THREADS_PER_BLOCK) {
             int elem_idx = i * VEC_ELEMS;
@@ -152,30 +141,24 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
 #endif
     };
 
-    // --- PRÓLOGO (precarga de la primera etapa) ---
     int write_stage = 0;
     int read_stage = 0;
 
     load_tile_async(write_stage, 0);
     write_stage ^= 1;
 
-    // --- BUCLE PRINCIPAL CON PIPELINE ---
     for (int64_t k0 = 0; k0 < K; k0 += TILE_K) {
         int64_t next_k = k0 + TILE_K;
 
-        // 1. Disparar carga asíncrona de la siguiente etapa si existe
         if (next_k < K) {
             load_tile_async(write_stage, next_k);
         }
 
-        // 2. Esperar a que los datos de la etapa de lectura estén disponibles
 #if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.wait_group 0;\n" ::);
 #endif
         __syncthreads();
 
-        // 3. Cómputo con Tensor Cores sobre los datos en shared memory
-        //    (ahora TILE_K=32 -> 2 pasos de WMMA_K=16)
         #pragma unroll
         for (int k_step = 0; k_step < TILE_K; k_step += WMMA_K) {
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, HalfT, wmma::row_major> a_frag[WARP_M_TILES];
@@ -204,19 +187,16 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
 
         __syncthreads();
 
-        // 4. Alternar buffers de lectura/escritura
         read_stage ^= 1;
         write_stage ^= 1;
     }
 
-    // --- EPÍLOGO: guardar resultado en shared memory y luego en global ---
     #pragma unroll
     for (int i = 0; i < WARP_M_TILES; ++i) {
         int warp_row = warp_m * (WARP_M_TILES * WMMA_M) + i * WMMA_M;
         #pragma unroll
         for (int j = 0; j < WARP_N_TILES; ++j) {
             int warp_col = warp_n * (WARP_N_TILES * WMMA_N) + j * WMMA_N;
-            // Almacenamos en el buffer float[TILE_M][TILE_N] sin padding
             wmma::store_matrix_sync(&shmem.Cs[warp_row][warp_col], c_frag[i][j],
                                     TILE_N, wmma::mem_row_major);
         }
@@ -224,7 +204,6 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
 
     __syncthreads();
 
-    // Escritura coalescedora a memoria global (conversión float -> HalfT)
     constexpr int C_ELEMS = TILE_M * TILE_N;
     #pragma unroll
     for (int i = tid; i < C_ELEMS; i += THREADS_PER_BLOCK) {
@@ -239,7 +218,6 @@ __device__ __forceinline__ void wmma_matmul_tile_optimized(
     }
 }
 
-// Kernel exportado (sin __launch_bounds__ para compatibilidad con el script de compilación)
 extern "C" __global__ void matmul_wmma_kernel(
     const KERNEL_DTYPE* A, const KERNEL_DTYPE* B, KERNEL_DTYPE* C,
     int64_t M, int64_t N, int64_t K)
