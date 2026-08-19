@@ -5,25 +5,6 @@ find_package(CUDAToolkit REQUIRED)
 find_package(PahoMqttCpp CONFIG REQUIRED)
 find_program(PYTHON3_EXECUTABLE NAMES python3 python REQUIRED)
 
-# ---------------------------------------------------------------------------
-# cuDNN -- a diferencia de cuBLAS/cuRAND/cuTENSOR, NO viene incluido en
-# CUDAToolkit ni tiene find_package propio de CMake. Se busca a mano.
-# Si tu instalacion no esta en una ruta estandar, pasa -DCUDNN_ROOT=<ruta>
-# a cmake (ej. "C:/Program Files/NVIDIA/CUDNN/v9.x" en Windows).
-#
-# Los paquetes de NVIDIA desde cuDNN 9.x+ NO ponen cudnn.h/cudnn.lib
-# directo en include/ y lib/ -- meten una carpeta intermedia con la
-# version de CUDA (ej. include/13.4/cudnn.h, lib/13.4/x64/cudnn.lib), y
-# ese numero cambia segun que build bajaste. Por eso buscamos con GLOB_RECURSE
-# en vez de un PATH_SUFFIXES fijo -- no queremos tener que actualizar el
-# CMakeLists cada vez que cambia esa carpeta intermedia.
-#
-# IMPORTANTE: filtramos a proposito cualquier ruta que contenga "arm64" --
-# NVIDIA tambien distribuye un build ARM64 de cuDNN (para Windows on ARM)
-# bajo la MISMA carpeta de version si bajaste el paquete equivocado, y esas
-# libs no linkean contra un build x64 (MSVC Hostx64 con CUDA x64). Si el
-# glob no encuentra nada x64 mas abajo, el error te lo va a decir.
-# ---------------------------------------------------------------------------
 if(CUDNN_ROOT OR DEFINED ENV{CUDNN_ROOT})
     set(_cudnn_search_root "${CUDNN_ROOT}")
     if(NOT _cudnn_search_root)
@@ -42,9 +23,6 @@ if(CUDNN_ROOT OR DEFINED ENV{CUDNN_ROOT})
     if(_cudnn_dll_candidates)
         list(GET _cudnn_dll_candidates 0 _cudnn_main_dll)
         get_filename_component(CUDNN_BIN_DIR "${_cudnn_main_dll}" DIRECTORY)
-        # cuDNN 9.x viene partido en varias DLLs (ops/graph/engines/heuristic/...)
-        # -- copiamos TODAS las que esten en ese bin/, no solo cudnn64_9.dll,
-        # porque esa es solo la "fachada" y carga las demas en runtime.
         file(GLOB CUDNN_RUNTIME_DLLS "${CUDNN_BIN_DIR}/*.dll")
     endif()
 
@@ -60,8 +38,6 @@ if(CUDNN_ROOT OR DEFINED ENV{CUDNN_ROOT})
     endif()
 endif()
 
-# Fallback: por si algun dia lo instalan en una ruta que CMake ya conoce
-# de memoria (find_path/find_library normales, sin glob).
 find_path(CUDNN_INCLUDE_DIR cudnn.h
         HINTS ${CUDAToolkit_INCLUDE_DIRS}
         PATH_SUFFIXES include
