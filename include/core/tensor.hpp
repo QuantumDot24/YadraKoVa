@@ -1,9 +1,10 @@
 #pragma once
 #include "core/memory.hpp"
-#include "core/host_buffer.hpp"
 #include "core/cuda_error.hpp"
 #include "core/stream.hpp"
 #include "core/executor.hpp"
+#include "core/backend.hpp"
+#include "core/backend_dispatch.hpp"
 #include <vector>
 #include <numeric>
 #include <cassert>
@@ -94,6 +95,7 @@ namespace yadrakova::core
             return host;
         }
 
+
         T* data() { return data_ptr_; }
         const T* data() const { return data_ptr_; }
         [[nodiscard]] const Shape& shape() const { return shape_; }
@@ -152,7 +154,7 @@ namespace yadrakova::core
             return Tensor(buffer_, std::move(new_shape), contiguous_strides(new_shape), offset_);
         }
 
-        Tensor gelu(Stream& stream = default_stream()) const
+        Tensor gelu(Backend backend = Backend::Auto, Stream& stream = default_stream()) const
         {
             if (!is_contiguous())
                 throw std::runtime_error(
@@ -167,11 +169,19 @@ namespace yadrakova::core
 
             std::vector<void*> args = {&in_ptr, &out_ptr, &n};
 
-            Executor::execute<T>("gelu", DimMap{{"n", n}}, args, stream);
+            auto resolution = OpsDispatch::resolve(Op::Gelu, dtype, backend);
+            if (resolution.backend == Backend::Custom)
+            {
+                Executor::execute<T>("gelu", DimMap{{"n", n}}, args, stream);
+            }
+            else
+            {
+                BackendRegistry::instance().invoke(Op::Gelu, resolution.backend, resolution.compute_dtype, args, stream);
+            }
             return out;
         }
 
-        Tensor softmax(Stream& stream = default_stream()) const
+        Tensor softmax(Backend backend = Backend::Auto, Stream& stream = default_stream()) const
         {
             if (ndim() != 2)
                 throw std::runtime_error(
@@ -191,11 +201,19 @@ namespace yadrakova::core
 
             std::vector<void*> args = {&in_ptr, &out_ptr, (void*)&rows, (void*)&cols};
 
-            Executor::execute<T>("softmax", DimMap{{"rows", rows}, {"cols", cols}}, args, stream);
+            auto resolution = OpsDispatch::resolve(Op::Softmax, dtype, backend);
+            if (resolution.backend == Backend::Custom)
+            {
+                Executor::execute<T>("softmax", DimMap{{"rows", rows}, {"cols", cols}}, args, stream);
+            }
+            else
+            {
+                BackendRegistry::instance().invoke(Op::Softmax, resolution.backend, resolution.compute_dtype, args, stream);
+            }
             return out;
         }
 
-        Tensor matmul(const Tensor<T>& B, Stream& stream) const
+        Tensor matmul(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const
         {
             if (ndim() != 2 || B.ndim() != 2)
             {
@@ -231,28 +249,39 @@ namespace yadrakova::core
                 &a_ptr, &b_ptr, &c_ptr, (void*)&M, (void*)&N, (void*)&K
             };
 
-            const char* kernel_name = "matmul_wmma";
-
-            Executor::execute<T>(kernel_name, DimMap{{"M", M}, {"N", N}, {"K", K}}, args, stream);
+            auto resolution = OpsDispatch::resolve(Op::MatMul, dtype, backend);
+            if (resolution.backend == Backend::Custom)
+            {
+                Executor::execute<T>("matmul_wmma", DimMap{{"M", M}, {"N", N}, {"K", K}}, args, stream);
+            }
+            else
+            {
+                BackendRegistry::instance().invoke(Op::MatMul, resolution.backend, resolution.compute_dtype, args, stream);
+            }
             return C;
         }
 
-        void to_device(const T* host_ptr, size_t count)
+        void to_device(const T* host_ptr, size_t count, Stream& stream = default_stream())
         {
             check_contiguous_for_transfer("to_device");
             if (count != static_cast<size_t>(numel()))
                 throw std::runtime_error("to_device: size mismatch (expected " +
                     std::to_string(numel()) + ", received " + std::to_string(count) + ")");
-            CUDA_CHECK(cudaMemcpy(data_ptr_, host_ptr, count * sizeof(T), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpyAsync(data_ptr_, host_ptr, count * sizeof(T),
+                cudaMemcpyHostToDevice, stream.raw()));
+            stream.synchronize();
         }
 
-        void to_host(T* host_ptr, size_t count) const
+
+        void to_host(T* host_ptr, size_t count, Stream& stream = default_stream()) const
         {
             check_contiguous_for_transfer("to_host");
             if (count != static_cast<size_t>(numel()))
                 throw std::runtime_error("to_host: size mismatch (expected " +
                     std::to_string(numel()) + ", received " + std::to_string(count) + ")");
-            CUDA_CHECK(cudaMemcpy(host_ptr, data_ptr_, count * sizeof(T), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpyAsync(host_ptr, data_ptr_, count * sizeof(T),
+                cudaMemcpyDeviceToHost, stream.raw()));
+            stream.synchronize();
         }
 
         void to_device(const HostBuffer<T>& host_buf) { to_device(host_buf.data(), host_buf.size()); }

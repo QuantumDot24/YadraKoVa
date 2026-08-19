@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CidrCTestProjectState">
+    <ctestState>
+      <lineNumber testId="path:CMakeLists.txt test:mqtt_smoke_test" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:softmax_gelu_backend_test" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_dtype_utils" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_gelu_softmax" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_graph" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_host_buffer" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_matmul" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_multi_op" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_stream_event" value="243" />
+      <lineNumber testId="path:CMakeLists.txt test:test_tensor" value="243" />
+    </ctestState>
+  </component>
+</project>

@@ -26,9 +26,9 @@ namespace yadrakova::core
     };
 
     float elapsed_ms(const Event& start, const Event& end);
-
+    
     template <typename Fn>
-    float time_kernel_ms(Stream& stream, Fn&& fn)
+    float time_kernel_ms(Fn&& fn, Stream& stream = default_stream())
     {
         Event start(true), end(true);
         start.record(stream);

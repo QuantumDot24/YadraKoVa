@@ -24,5 +24,27 @@ namespace yadrakova::core
         cudaStream_t handle_ = nullptr;
     };
 
+    // Stream activo del hilo actual. Lazy: se crea solo la primera vez que
+    // se pide, uno por hilo. Es lo que usan matmul/softmax/gelu/time_kernel_ms
+    // como default -- en el uso normal nadie necesita saber que esto existe.
     Stream& default_stream();
+
+    // Azucar: equivalente a default_stream().synchronize().
+    void synchronize();
+
+    // Escape hatch para multi-stream real (overlap, multi-GPU). Mientras el
+    // guard esta vivo, default_stream() devuelve `s` en vez del stream lazy
+    // del hilo. Restaura el anterior al salir de scope -- soporta anidar.
+    class StreamGuard
+    {
+    public:
+        explicit StreamGuard(Stream& s);
+        ~StreamGuard();
+
+        StreamGuard(const StreamGuard&) = delete;
+        StreamGuard& operator=(const StreamGuard&) = delete;
+
+    private:
+        Stream* previous_;
+    };
 } // namespace yadrakova::core

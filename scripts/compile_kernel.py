@@ -448,7 +448,7 @@ def main():
     cpp_out_dir = Path(args.output_dir) if args.output_dir else Path("generated/kernels")
     registry_header = Path(config["kernels"].get("registry_header", "include/kernels/registry.hpp")).resolve()
     dispatch_registry_header = Path(
-        config["kernels"].get("dispatch_registry_header", "include/core/dispatch_registry.hpp")
+        config["kernels"].get("dispatch_registry_header", "include/core/executor.hpp")
     ).resolve()
     cache_dir = Path(config["cache"]["dir"])
 
