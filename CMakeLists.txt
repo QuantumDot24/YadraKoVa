@@ -1,69 +1,71 @@
 cmake_minimum_required(VERSION 4.3)
 project(YadraKoVa LANGUAGES CXX CUDA)
 
+# ---------------------------------------------------------------------------
+# 1. Dependencies
+# ---------------------------------------------------------------------------
 find_package(CUDAToolkit REQUIRED)
 find_package(PahoMqttCpp CONFIG REQUIRED)
 find_program(PYTHON3_EXECUTABLE NAMES python3 python REQUIRED)
 
-if(CUDNN_ROOT OR DEFINED ENV{CUDNN_ROOT})
-    set(_cudnn_search_root "${CUDNN_ROOT}")
-    if(NOT _cudnn_search_root)
-        set(_cudnn_search_root "$ENV{CUDNN_ROOT}")
-    endif()
-
-    file(GLOB_RECURSE _cudnn_header_candidates "${_cudnn_search_root}/cudnn.h")
-    file(GLOB_RECURSE _cudnn_lib_candidates "${_cudnn_search_root}/cudnn.lib")
-    file(GLOB_RECURSE _cudnn_so_candidates "${_cudnn_search_root}/libcudnn.so")
-    file(GLOB_RECURSE _cudnn_dll_candidates "${_cudnn_search_root}/cudnn64_9.dll")
-
-    list(FILTER _cudnn_lib_candidates EXCLUDE REGEX "[Aa][Rr][Mm]64")
-    list(FILTER _cudnn_header_candidates EXCLUDE REGEX "[Aa][Rr][Mm]64")
-    list(FILTER _cudnn_dll_candidates EXCLUDE REGEX "[Aa][Rr][Mm]64")
-
-    if(_cudnn_dll_candidates)
-        list(GET _cudnn_dll_candidates 0 _cudnn_main_dll)
-        get_filename_component(CUDNN_BIN_DIR "${_cudnn_main_dll}" DIRECTORY)
-        file(GLOB CUDNN_RUNTIME_DLLS "${CUDNN_BIN_DIR}/*.dll")
-    endif()
-
-    if(_cudnn_header_candidates)
-        list(GET _cudnn_header_candidates 0 _cudnn_header_full_path)
-        get_filename_component(CUDNN_INCLUDE_DIR "${_cudnn_header_full_path}" DIRECTORY)
-    endif()
-
-    if(_cudnn_lib_candidates)
-        list(GET _cudnn_lib_candidates 0 CUDNN_LIBRARY)
-    elseif(_cudnn_so_candidates)
-        list(GET _cudnn_so_candidates 0 CUDNN_LIBRARY)
-    endif()
-endif()
-
-find_path(CUDNN_INCLUDE_DIR cudnn.h
-        HINTS ${CUDAToolkit_INCLUDE_DIRS}
+# --- cuDNN ---
+find_path(CUDNN_INCLUDE_DIR NAMES cudnn.h cudnn_version.h
+        HINTS ${CUDAToolkit_INCLUDE_DIRS} $ENV{CUDNN_PATH} ${CUDNN_ROOT}
         PATH_SUFFIXES include
 )
 find_library(CUDNN_LIBRARY NAMES cudnn
-        HINTS ${CUDAToolkit_LIBRARY_DIR}
+        HINTS ${CUDAToolkit_LIBRARY_DIR} $ENV{CUDNN_PATH} ${CUDNN_ROOT}
         PATH_SUFFIXES lib lib/x64 lib64
 )
-
 if(NOT CUDNN_INCLUDE_DIR OR NOT CUDNN_LIBRARY)
-    message(FATAL_ERROR
-            "YadraKoVa -- cuDNN no encontrado (cudnn.h / cudnn.lib|libcudnn) "
-            "buscando bajo CUDNN_ROOT='${CUDNN_ROOT}'. Revisa que: "
-            "(1) sea el paquete Windows x86_64 de cuDNN, no ARM64; "
-            "(2) CUDNN_ROOT apunte a la carpeta que tiene bin/include/lib adentro.")
+    message(FATAL_ERROR "cuDNN not found. Please set CUDNN_ROOT or ensure it is installed in the CUDA Toolkit path.")
 endif()
 add_library(CUDNN::cudnn UNKNOWN IMPORTED)
 set_target_properties(CUDNN::cudnn PROPERTIES
         IMPORTED_LOCATION "${CUDNN_LIBRARY}"
         INTERFACE_INCLUDE_DIRECTORIES "${CUDNN_INCLUDE_DIR}"
 )
-message(STATUS "YadraKoVa -- cuDNN include: ${CUDNN_INCLUDE_DIR}")
-message(STATUS "YadraKoVa -- cuDNN lib:     ${CUDNN_LIBRARY}")
 
+# --- cuTENSOR (CUDA 12/13 aware - FORZADO) ---
+set(CUTENSOR_ROOT_HINTS "C:/Program Files/NVIDIA cuTENSOR/v2.7" $ENV{CUTENSOR_PATH})
+find_path(CUTENSOR_INCLUDE_DIR NAMES cutensor.h
+        HINTS ${CUTENSOR_ROOT_HINTS}
+        PATH_SUFFIXES include
+)
+
+# DETECCIÓN AUTOMÁTICA: Usar la versión de CUDA instalada
+if(CUDAToolkit_VERSION_MAJOR EQUAL 13)
+    set(_cutensor_lib_suffix "lib/13")
+    set(_cutensor_bin_suffix "bin/13")
+    message(STATUS "cuTENSOR: Detected CUDA 13.x, using lib/13 and bin/13")
+elseif(CUDAToolkit_VERSION_MAJOR EQUAL 12)
+    set(_cutensor_lib_suffix "lib/12")
+    set(_cutensor_bin_suffix "bin/12")
+    message(STATUS "cuTENSOR: Detected CUDA 12.x, using lib/12 and bin/12")
+else()
+    message(FATAL_ERROR "cuTENSOR: Unsupported CUDA version ${CUDAToolkit_VERSION_MAJOR}. Only CUDA 12 and 13 are supported.")
+endif()
+
+find_library(CUTENSOR_LIBRARY NAMES cutensor
+        HINTS ${CUTENSOR_ROOT_HINTS}
+        PATH_SUFFIXES ${_cutensor_lib_suffix}
+        NO_DEFAULT_PATH  # CRÍTICO: No buscar en otras ubicaciones
+)
+
+if(NOT CUTENSOR_INCLUDE_DIR OR NOT CUTENSOR_LIBRARY)
+    message(FATAL_ERROR "cuTENSOR not found in ${CUTENSOR_ROOT_HINTS}/${_cutensor_lib_suffix}. Please verify the installation.")
+endif()
+
+add_library(CUTENSOR::cutensor UNKNOWN IMPORTED)
+set_target_properties(CUTENSOR::cutensor PROPERTIES
+        IMPORTED_LOCATION "${CUTENSOR_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${CUTENSOR_INCLUDE_DIR}"
+)
+
+message(STATUS "cuTENSOR include: ${CUTENSOR_INCLUDE_DIR}")
+message(STATUS "cuTENSOR lib:     ${CUTENSOR_LIBRARY}")
 # ---------------------------------------------------------------------------
-# Language standards
+# 2. Language Standards & Flags
 # ---------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,12 +76,15 @@ set(CMAKE_CUDA_ARCHITECTURES 86)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
 # ---------------------------------------------------------------------------
-# Auto-discovery of sources and includes (everything that is NOT auto-generated)
+# 3. Source Discovery
 # ---------------------------------------------------------------------------
 file(GLOB_RECURSE YADRAKOVA_CORE_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/core/*.cpp"
         "${CMAKE_SOURCE_DIR}/src/core/*.cu"
+        "${CMAKE_SOURCE_DIR}/src/backends/*.cpp"
+        "${CMAKE_SOURCE_DIR}/src/backends/*.cu"
         "${CMAKE_SOURCE_DIR}/src/telemetry/*.cpp"
         "${CMAKE_SOURCE_DIR}/src/train/*.cpp"
 )
@@ -93,36 +98,17 @@ file(GLOB_RECURSE YADRAKOVA_TEST_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/tests/*.cpp"
 )
 
-file(GLOB KERNEL_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.cu")
+# Excluir el test standalone del glob principal (se compila aparte)
+list(REMOVE_ITEM YADRAKOVA_TEST_SOURCES
+        "${CMAKE_SOURCE_DIR}/tests/test_cutensor_standalone.cpp"
+)
 
-# NEW: glob of dispatch .yaml files, with CONFIGURE_DEPENDS -- if
-# you add/remove a .yaml, CMake must reconfigure, because further
-# below we decide AT CONFIGURATION TIME (with EXISTS) whether that
-# kernel has a *_dispatch.generated.cpp as an expected output.
-# Without this glob, adding a new .yaml would not trigger a reconfiguration
-# and the build would remain stale until a manual cmake.
+file(GLOB KERNEL_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.cu")
 file(GLOB_RECURSE KERNEL_YAML_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.yaml")
+file(GLOB SHARED_KERNEL_HEADERS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/include/kernels/*.cuh")
 
 # ---------------------------------------------------------------------------
-# Kernel codegen -- explicit OUTPUT, NOT glob, for the registration
-# .cpp files. CMake knows the output names at configuration time
-# (they are derived 1:1 from the input .cu files), so Ninja
-# treats them as real dependencies regardless of timing/cache of the
-# Python script. This eliminates the race that caused "no kernel
-# registered" in subsequent builds.
-#
-# The .cuh files (data only) CAN live in include/ and be discovered by
-# normal glob, because nobody compiles them directly -- they are just
-# included. The race problem only applies to real compilation
-# units (.cpp), not to headers.
-#
-# NEW: in addition to "{kernel}_registration.cpp" (always), we add
-# "{kernel}_dispatch.generated.cpp" ONLY if a
-# src/kernels/{kernel}.yaml exists -- incremental migration, kernel by
-# kernel. compile_kernel.py does exactly this same check
-# (find_dispatch_yaml) on the Python side; here we replicate it on
-# the CMake side because the custom_command needs to declare its
-# OUTPUT in advance, at configuration time.
+# 4. Kernel Codegen
 # ---------------------------------------------------------------------------
 set(KERNEL_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/kernels")
 set(KERNEL_GENERATED_SOURCES "")
@@ -140,8 +126,6 @@ foreach(kernel_src ${KERNEL_SOURCES})
     endif()
 endforeach()
 
-file(GLOB SHARED_KERNEL_HEADERS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/include/kernels/*.cuh")
-
 add_custom_command(
         OUTPUT ${KERNEL_GENERATED_SOURCES}
         COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/compile_kernel.py
@@ -155,7 +139,7 @@ add_custom_command(
 )
 
 # ---------------------------------------------------------------------------
-# Core library
+# 5. Core Library
 # ---------------------------------------------------------------------------
 add_library(yadrakova_core STATIC
         ${YADRAKOVA_CORE_SOURCES}
@@ -177,26 +161,52 @@ target_link_libraries(yadrakova_core PUBLIC
         CUDA::cublas
         CUDA::curand
         CUDNN::cudnn
+        CUTENSOR::cutensor
         PahoMqttCpp::paho-mqttpp3
 )
 
 # ---------------------------------------------------------------------------
-# Tests -- one executable per file in tests/. /WHOLEARCHIVE is
-# necessary because the registration .cpp files (both KernelRegistry and,
-# now, DispatchRegistry) don't export symbols that anyone calls
-# directly -- without this, the linker discards them from
-# yadrakova_core.lib as "unused", and the static registration never
-# runs (effect: "no kernel registered for X" or "no dispatch rule
-# registered for X" at runtime, with a clean build).
+# 6. Tests
 # ---------------------------------------------------------------------------
 enable_testing()
 
-foreach(test_src ${YADRAKOVA_TEST_SOURCES})
-    get_filename_component(test_name ${test_src} NAME_WE)
+# Pre-fetch DLL paths for Windows runtime (cuTENSOR 2.x aware)
+if(WIN32)
+    # --- cuDNN DLLs ---
+    get_filename_component(_cudnn_lib_dir "${CUDNN_LIBRARY}" DIRECTORY)
+    set(_cudnn_bin_dir "${_cudnn_lib_dir}/../bin")
+    if(EXISTS "${_cudnn_bin_dir}/cudnn64_9.dll")
+        set(CUDNN_RUNTIME_DLLS "${_cudnn_bin_dir}/cudnn64_9.dll")
+    else()
+        file(GLOB CUDNN_RUNTIME_DLLS "${_cudnn_bin_dir}/cudnn*.dll" "${_cudnn_lib_dir}/cudnn*.dll")
+    endif()
+
+    # --- cuTENSOR DLLs (USANDO LA VERSIÓN CORRECTA) ---
+    get_filename_component(_cutensor_root_dir "${CUTENSOR_ROOT_HINTS}" DIRECTORY)
+    set(_cutensor_bin_dir "${CUTENSOR_ROOT_HINTS}/${_cutensor_bin_suffix}")
+
+    if(EXISTS "${_cutensor_bin_dir}/cutensor.dll")
+        set(CUTENSOR_RUNTIME_DLLS
+                "${_cutensor_bin_dir}/cutensor.dll"
+                "${_cutensor_bin_dir}/cutensorMg.dll"
+        )
+        message(STATUS "cuTENSOR DLLs found in: ${_cutensor_bin_dir}")
+    else()
+        message(FATAL_ERROR "cuTENSOR DLLs not found in ${_cutensor_bin_dir}")
+    endif()
+endif()   # <-- ESTE endif() FALTABA (cierra el if(WIN32))
+
+# Helper function para configurar tests (evita duplicación)
+function(configure_yadrakova_test test_name test_src)
     add_executable(${test_name} ${test_src})
     target_link_libraries(${test_name} PRIVATE yadrakova_core)
+
+    # WHOLEARCHIVE necesario para que el linker no descarte los registros estáticos
     if(MSVC)
         target_link_options(${test_name} PRIVATE "/WHOLEARCHIVE:yadrakova_core")
+        # BUG FIX: cuTENSOR 2.x en Windows necesita stack > 1 MB
+        # (el planificador usa recursión profunda para selección de kernels)
+        target_link_options(${test_name} PRIVATE "/STACK:16777216")
     else()
         target_link_options(${test_name} PRIVATE "-Wl,--whole-archive" yadrakova_core "-Wl,--no-whole-archive")
     endif()
@@ -205,37 +215,71 @@ foreach(test_src ${YADRAKOVA_TEST_SOURCES})
             CUDA_SEPARABLE_COMPILATION ON
     )
 
-    # Windows no tiene rpath -- el .exe busca DLLs en su propio directorio o
-    # en el PATH del sistema. cuDNN via zip (a diferencia del CUDA Toolkit,
-    # que si se agrega solo al PATH con su instalador) no toca el PATH, asi
-    # que sin esto el .exe compila y linkea bien pero explota en runtime con
-    # STATUS_DLL_NOT_FOUND (0xC0000135) apenas intenta cargar cudnn64_9.dll.
-    if(WIN32 AND CUDNN_RUNTIME_DLLS)
-        add_custom_command(TARGET ${test_name} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CUDNN_RUNTIME_DLLS} $<TARGET_FILE_DIR:${test_name}>
-                COMMENT "Copiando DLLs de cuDNN junto a ${test_name}"
-        )
+    # Copiar DLLs necesarias junto al ejecutable en Windows
+    if(WIN32)
+        set(_dlls_to_copy "")
+        if(CUDNN_RUNTIME_DLLS)
+            list(APPEND _dlls_to_copy ${CUDNN_RUNTIME_DLLS})
+        endif()
+        if(CUTENSOR_RUNTIME_DLLS)
+            list(APPEND _dlls_to_copy ${CUTENSOR_RUNTIME_DLLS})
+        endif()
+
+        if(_dlls_to_copy)
+            add_custom_command(TARGET ${test_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_dlls_to_copy} $<TARGET_FILE_DIR:${test_name}>
+                    COMMENT "Copying CUDA runtime DLLs next to ${test_name}"
+            )
+        endif()
     endif()
 
     add_test(NAME ${test_name} COMMAND ${test_name})
+endfunction()
+
+# Crear todos los tests usando el helper
+foreach(test_src ${YADRAKOVA_TEST_SOURCES})
+    get_filename_component(test_name ${test_src} NAME_WE)
+    configure_yadrakova_test(${test_name} ${test_src})
 endforeach()
 
+# --- Test standalone de cuTENSOR (aislado, sin yadrakova_core) ---
+add_executable(test_cutensor_standalone
+        ${CMAKE_SOURCE_DIR}/tests/test_cutensor_standalone.cpp
+)
+target_link_libraries(test_cutensor_standalone PRIVATE
+        CUDA::cudart
+        CUTENSOR::cutensor
+)
+target_include_directories(test_cutensor_standalone PRIVATE
+        ${CUTENSOR_INCLUDE_DIR}
+)
+set_target_properties(test_cutensor_standalone PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+)
+if(MSVC)
+    # Mismo fix de stack para el standalone
+    target_link_options(test_cutensor_standalone PRIVATE "/STACK:16777216")
+endif()
+
+# Copiar DLLs de cuTENSOR al standalone también
+if(WIN32 AND CUTENSOR_RUNTIME_DLLS)
+    add_custom_command(TARGET test_cutensor_standalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CUTENSOR_RUNTIME_DLLS} $<TARGET_FILE_DIR:test_cutensor_standalone>
+            COMMENT "Copying cuTENSOR DLLs next to test_cutensor_standalone"
+    )
+endif()
+
+add_test(NAME test_cutensor_standalone COMMAND test_cutensor_standalone)
+
 # ---------------------------------------------------------------------------
-# Diagnostics
+# 7. Diagnostics
 # ---------------------------------------------------------------------------
-message(STATUS "YadraKoVa -- core sources detected:")
-foreach(src ${YADRAKOVA_CORE_SOURCES})
-    message(STATUS "  ${src}")
-endforeach()
-message(STATUS "YadraKoVa -- .cu kernels detected:")
-foreach(src ${KERNEL_SOURCES})
-    message(STATUS "  ${src}")
-endforeach()
-message(STATUS "YadraKoVa -- generated .cpp (registration + dispatch, explicit OUTPUT):")
-foreach(src ${KERNEL_GENERATED_SOURCES})
-    message(STATUS "  ${src}")
-endforeach()
-message(STATUS "YadraKoVa -- tests detected:")
-foreach(src ${YADRAKOVA_TEST_SOURCES})
-    message(STATUS "  ${src}")
-endforeach()
+message(STATUS "YadraKoVa -- Core sources detected: ${YADRAKOVA_CORE_SOURCES}")
+message(STATUS "YadraKoVa -- .cu kernels detected: ${KERNEL_SOURCES}")
+message(STATUS "YadraKoVa -- Generated .cpp (registration + dispatch): ${KERNEL_GENERATED_SOURCES}")
+message(STATUS "YadraKoVa -- Tests detected: ${YADRAKOVA_TEST_SOURCES}")
+message(STATUS "YadraKoVa -- cuDNN include: ${CUDNN_INCLUDE_DIR}")
+message(STATUS "YadraKoVa -- cuDNN lib:     ${CUDNN_LIBRARY}")
+message(STATUS "YadraKoVa -- cuTENSOR include: ${CUTENSOR_INCLUDE_DIR}")
+message(STATUS "YadraKoVa -- cuTENSOR lib:     ${CUTENSOR_LIBRARY}")
+message(STATUS "YadraKoVa -- cuTENSOR lib suffix (CUDA version): ${_cutensor_lib_suffix}")

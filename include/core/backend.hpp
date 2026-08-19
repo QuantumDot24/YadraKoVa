@@ -58,9 +58,10 @@ namespace yadrakova::core
         Dropout,
         Add,
         Mul,
+        Contiguous
     };
 
-    inline constexpr size_t kNumOps = 10;
+    inline constexpr size_t kNumOps = 11;
 
     inline const char* op_name(Op op)
     {
@@ -76,6 +77,7 @@ namespace yadrakova::core
         case Op::Dropout:   return "dropout";
         case Op::Add:       return "add";
         case Op::Mul:       return "mul";
+            case Op::Contiguous: return "contiguous";
         }
         throw std::runtime_error("op_name: Op desconocido");
     }

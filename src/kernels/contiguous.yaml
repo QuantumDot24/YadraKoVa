@@ -1,0 +1,15 @@
+kernel: contiguous
+dims: [numel]
+block: [256, 1, 1]
+grid: elementwise(numel)
+
+args:
+  - name: src
+    kind: in
+  - name: dst
+    kind: out
+  - name: view
+    kind: scalar
+  - name: numel
+    kind: scalar
+    dtype: int64

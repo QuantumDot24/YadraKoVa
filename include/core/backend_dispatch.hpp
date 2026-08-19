@@ -208,7 +208,8 @@ namespace yadrakova::core
             static const std::array<std::array<DTypeMask, kNumLibBackends>, kNumOps> t = []
             {
                 std::array<std::array<DTypeMask, kNumLibBackends>, kNumOps> caps{};
-
+                caps[std::to_underlying(Op::Add)][2 /*CuTensor*/] = dtype_bit(DType::BF16) | dtype_bit(DType::FP32) | dtype_bit(DType::FP16);
+                caps[std::to_underlying(Op::Mul)][2 /*CuTensor*/] = dtype_bit(DType::BF16) | dtype_bit(DType::FP32) | dtype_bit(DType::FP16);
                 // cublasGemmEx: bf16/fp32/fp16. INT8 usa el camino IMMA
                 // (layout/alineacion distintos) -- se deja fuera a proposito,
                 // matmul en int8 cae directo a Custom.

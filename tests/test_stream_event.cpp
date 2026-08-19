@@ -17,12 +17,13 @@ void test_event_timing() {
     Stream s;
     Tensor<float> t({1024, 1024});
 
-    float ms = time_kernel_ms(s, [&]() {
+    // CORRECCIÓN: El orden de los parámetros es (func, stream)
+    float ms = time_kernel_ms([&]() {
         cudaMemsetAsync(t.data(), 0, t.numel() * sizeof(float), s.raw());
-    });
+    }, s);
 
-    assert(ms >= 0.0f); // el tiempo real variara por hardware, solo validamos que se pudo medir
-    std::cout << "[OK] event_timing (memset de 1024x1024 tomo " << ms << " ms)\n";
+    assert(ms >= 0.0f); // El tiempo real variará por hardware, solo validamos que se pudo medir
+    std::cout << "[OK] event_timing (memset de 1024x1024 tomó " << ms << " ms)\n";
 }
 
 void test_stream_is_done_polling() {
@@ -35,9 +36,10 @@ void test_stream_is_done_polling() {
 }
 
 int main() {
+    std::cout << "=== SUITE DE TESTS: STREAM & EVENT ===\n";
     test_stream_create_and_sync();
     test_event_timing();
     test_stream_is_done_polling();
-    std::cout << "Todos los tests de stream/event pasaron.\n";
+    std::cout << "Todos los tests de stream/event pasaron correctamente.\n\n";
     return 0;
 }

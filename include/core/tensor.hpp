@@ -110,6 +110,7 @@ namespace yadrakova::core
 
         [[nodiscard]] bool is_contiguous() const { return strides_ == contiguous_strides(shape_); }
 
+
         Tensor transpose(int dim0, int dim1) const
         {
             assert(dim0 >= 0 && dim0 < (int)ndim() && dim1 >= 0 && dim1 < (int)ndim());
@@ -260,16 +261,122 @@ namespace yadrakova::core
             }
             return C;
         }
+          Tensor add(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const
+    {
+        if (numel() != B.numel())
+            throw std::runtime_error("add: numel mismatch between operands");
+        if (!is_contiguous() || !B.is_contiguous())
+            throw std::runtime_error("add: both operands must be contiguous (materialize a copy if needed)");
 
-        void to_device(const T* host_ptr, size_t count, Stream& stream = default_stream())
+        Tensor<T> out(shape_);
+
+        const void* a_ptr = this->data_ptr_;
+        const void* b_ptr = B.data_ptr_;
+        void* c_ptr = out.data_ptr_;
+        int64_t n = numel();
+
+        // Conversión implícita de const void** a void* (igual que matmul)
+        std::vector<void*> args = {&a_ptr, &b_ptr, &c_ptr, &n};
+
+        auto resolution = OpsDispatch::resolve(Op::Add, dtype, backend);
+
+        if (resolution.backend == Backend::Custom)
+        {
+            Executor::execute<T>("add", DimMap{{"n", n}}, args, stream);
+        }
+        else
+        {
+            BackendRegistry::instance().invoke(Op::Add, resolution.backend, resolution.compute_dtype, args, stream);
+        }
+        return out;
+    }
+
+    Tensor mul(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const
+    {
+        if (numel() != B.numel())
+            throw std::runtime_error("mul: numel mismatch between operands");
+        if (!is_contiguous() || !B.is_contiguous())
+            throw std::runtime_error("mul: both operands must be contiguous (materialize a copy if needed)");
+
+        Tensor<T> out(shape_);
+
+        const void* a_ptr = this->data_ptr_;
+        const void* b_ptr = B.data_ptr_;
+        void* c_ptr = out.data_ptr_;
+        int64_t n = numel();
+
+        // Conversión implícita de const void** a void* (igual que matmul)
+        std::vector<void*> args = {&a_ptr, &b_ptr, &c_ptr, &n};
+
+        auto resolution = OpsDispatch::resolve(Op::Mul, dtype, backend);
+
+        if (resolution.backend == Backend::Custom)
+        {
+            Executor::execute<T>("mul", DimMap{{"n", n}}, args, stream);
+        }
+        else
+        {
+            BackendRegistry::instance().invoke(Op::Mul, resolution.backend, resolution.compute_dtype, args, stream);
+        }
+        return out;
+    }
+        [[nodiscard]] Tensor<T> contiguous(Backend backend = Backend::Auto, Stream& stream = default_stream()) const
+        {
+            if (is_contiguous())
+            {
+                return *this; // Si ya es continuo, retornamos una copia superficial
+            }
+
+            // 1. Crear tensor destino contiguo con la misma forma
+            Tensor<T> out(shape_);
+
+            // 2. Preparar la estructura de la vista para el kernel CUDA
+            constexpr int MAX_DIMS = 8;
+            struct TensorViewInfo {
+                int64_t shape[MAX_DIMS];
+                int64_t strides[MAX_DIMS];
+                int ndim;
+            };
+
+            TensorViewInfo view_info;
+            view_info.ndim = static_cast<int>(ndim());
+            for (size_t i = 0; i < ndim(); ++i) {
+                view_info.shape[i] = shape_[i];
+                view_info.strides[i] = strides_[i];
+            }
+
+            int64_t total_elements = numel();
+
+            const T* in_ptr = this->data_ptr_;
+            T* out_ptr = out.data_ptr_;
+
+            // 3. Empaquetar argumentos para el Executor (coincidiendo con contiguous.cu)
+            std::vector<void*> args = {
+                (void*)&in_ptr,
+                (void*)&out_ptr,
+                (void*)&view_info,
+                (void*)&total_elements
+            };
+
+            // 4. Resolver backend y ejecutar mediante tu infraestructura AOT
+            auto resolution = OpsDispatch::resolve(Op::Contiguous, dtype, backend);
+            if (resolution.backend == Backend::Custom)
+            {
+                Executor::execute<T>("contiguous", DimMap{{"numel", total_elements}}, args, stream);
+            }
+            else
+            {
+                BackendRegistry::instance().invoke(Op::Contiguous, resolution.backend, resolution.compute_dtype, args, stream);
+            }
+
+            return out;
+        }
+        void to_device(const T* host_ptr, size_t count)
         {
             check_contiguous_for_transfer("to_device");
             if (count != static_cast<size_t>(numel()))
-                throw std::runtime_error("to_device: size mismatch (expected " +
-                    std::to_string(numel()) + ", received " + std::to_string(count) + ")");
-            CUDA_CHECK(cudaMemcpyAsync(data_ptr_, host_ptr, count * sizeof(T),
-                cudaMemcpyHostToDevice, stream.raw()));
-            stream.synchronize();
+                throw std::runtime_error("to_device: size mismatch");
+            CUDA_CHECK(cudaMemcpy(data_ptr_, host_ptr, count * sizeof(T), cudaMemcpyHostToDevice));
         }
 
 
@@ -287,13 +394,14 @@ namespace yadrakova::core
         void to_device(const HostBuffer<T>& host_buf) { to_device(host_buf.data(), host_buf.size()); }
         void to_host(HostBuffer<T>& host_buf) const { to_host(host_buf.data(), host_buf.size()); }
 
-        void to_device_async(const HostBuffer<T>& host_buf, Stream& stream)
+        void to_device_async(const HostBuffer<T>& host_buf, Stream& stream = default_stream())
         {
             check_contiguous_for_transfer("to_device_async");
             if (host_buf.size() != static_cast<size_t>(numel()))
                 throw std::runtime_error("to_device_async: size mismatch");
+
             CUDA_CHECK(cudaMemcpyAsync(data_ptr_, host_buf.data(), host_buf.bytes(),
-                cudaMemcpyHostToDevice, stream.raw()));
+                                       cudaMemcpyHostToDevice, stream.raw()));
         }
 
         void to_host_async(HostBuffer<T>& host_buf, Stream& stream) const

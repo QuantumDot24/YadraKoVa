@@ -17,7 +17,8 @@ namespace yadrakova::core
         DeviceBuffer() = default;
         DeviceBuffer(void* p, size_t s, int dev) : ptr(p), size_bytes(s), device_id(dev) {}
     };
-
+    class Stream;
+    Stream& default_stream();
     class MemoryPool
     {
     public:
@@ -27,8 +28,7 @@ namespace yadrakova::core
         MemoryPool& operator=(const MemoryPool&) = delete;
 
         void preallocate(size_t size_bytes, size_t count) const;
-        std::shared_ptr<DeviceBuffer> allocate(size_t size_bytes) const;
-
+        std::shared_ptr<DeviceBuffer> allocate(size_t size_bytes, Stream& stream = default_stream()) const;
         [[nodiscard]] size_t bytes_in_use() const;
         [[nodiscard]] size_t bytes_reserved() const;
         [[nodiscard]] long outstanding_buffers() const;
