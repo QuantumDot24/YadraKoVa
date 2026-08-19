@@ -1,6 +1,7 @@
 #pragma once
 #include "core/backend.hpp"
 #include "core/stream.hpp"
+#include "core/executor.hpp"
 #include "dtype_utils.hpp"
 #include <array>
 #include <cuda_runtime.h>
@@ -127,10 +128,6 @@ namespace yadrakova::core
     // Tabla de capacidades: que dtypes soporta cada (Op, Backend de
     // libreria). Custom no vive aca -- soporta kAllDTypes siempre, lo que
     // realmente compile es responsabilidad de config.yaml/KernelRegistry.
-    //
-    // Hoy la tabla arranca en cero salvo MatMul/CuBLAS, Softmax/CuDNN y
-    // Randn/CuRAND, que son los unicos backends de libreria implementados.
-    // Activar uno nuevo es una linea en table(), sin tocar Tensor.
     // ------------------------------------------------------------------
     using DTypeMask = uint8_t;
 
@@ -170,16 +167,17 @@ namespace yadrakova::core
 
             switch (op)
             {
-            case Op::MatMul:    return matmul_order;
-            case Op::Conv2D:    return conv_order;
+            case Op::MatMul:      return matmul_order;
+            case Op::Conv2D:      return conv_order;
             case Op::Gelu:
             case Op::Softmax:
             case Op::LayerNorm:
-            case Op::BatchNorm: return norm_activation_order;
+            case Op::BatchNorm:   return norm_activation_order;
             case Op::Randn:
-            case Op::Dropout:   return random_order;
+            case Op::Dropout:     return random_order;
             case Op::Add:
-            case Op::Mul:       return elementwise_order;
+            case Op::Mul:         return elementwise_order;
+            case Op::Contiguous:  return custom_only;
             }
             return custom_only;
         }
@@ -208,8 +206,13 @@ namespace yadrakova::core
             static const std::array<std::array<DTypeMask, kNumLibBackends>, kNumOps> t = []
             {
                 std::array<std::array<DTypeMask, kNumLibBackends>, kNumOps> caps{};
-                caps[std::to_underlying(Op::Add)][2 /*CuTensor*/] = dtype_bit(DType::BF16) | dtype_bit(DType::FP32) | dtype_bit(DType::FP16);
-                caps[std::to_underlying(Op::Mul)][2 /*CuTensor*/] = dtype_bit(DType::BF16) | dtype_bit(DType::FP32) | dtype_bit(DType::FP16);
+
+                // cuTensor elementwise: bf16/fp32/fp16.
+                caps[std::to_underlying(Op::Add)][2 /*CuTensor*/] =
+                    dtype_bit(DType::BF16) | dtype_bit(DType::FP32) | dtype_bit(DType::FP16);
+                caps[std::to_underlying(Op::Mul)][2 /*CuTensor*/] =
+                    dtype_bit(DType::BF16) | dtype_bit(DType::FP32) | dtype_bit(DType::FP16);
+
                 // cublasGemmEx: bf16/fp32/fp16. INT8 usa el camino IMMA
                 // (layout/alineacion distintos) -- se deja fuera a proposito,
                 // matmul en int8 cae directo a Custom.
@@ -309,4 +312,23 @@ namespace yadrakova::core
             return {op, Backend::Custom, requested_dtype, false};
         }
     };
+
+    // ------------------------------------------------------------------
+    // dispatch_op: el molde comun usado por TODAS las ops de Tensor
+    // (gelu/softmax/matmul/add/mul/contiguous, definidas en
+    // tensor_ops.hpp). Resuelve via OpsDispatch y lanza Custom o la
+    // libreria segun corresponda. Funcion libre (NO metodo de
+    // OpsDispatch) para poder llamarla sin instanciar nada:
+    // dispatch_op<T>(...) directo.
+    // ------------------------------------------------------------------
+    template <typename T>
+    void dispatch_op(Op op, const std::string& kernel_name, const DimMap& dims,
+                      const std::vector<void*>& args, Backend backend, Stream& stream)
+    {
+        auto resolution = OpsDispatch::resolve(op, dtype_traits<T>::value, backend);
+        if (resolution.backend == Backend::Custom)
+            Executor::execute<T>(kernel_name, dims, args, stream);
+        else
+            BackendRegistry::instance().invoke(op, resolution.backend, resolution.compute_dtype, args, stream);
+    }
 } // namespace yadrakova::core

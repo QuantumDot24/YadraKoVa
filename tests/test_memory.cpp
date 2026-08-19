@@ -1,4 +1,5 @@
 #include "core/tensor.hpp"
+#include "core/tensor_ops.hpp"
 #include "core/stream.hpp"
 #include "core/memory.hpp"
 #include <iostream>

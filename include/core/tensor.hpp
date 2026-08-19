@@ -2,16 +2,13 @@
 #include "core/memory.hpp"
 #include "core/cuda_error.hpp"
 #include "core/stream.hpp"
-#include "core/executor.hpp"
 #include "core/backend.hpp"
-#include "core/backend_dispatch.hpp"
 #include <vector>
 #include <numeric>
 #include <cassert>
 #include <stdexcept>
 #include <cuda_runtime.h>
 #include <random>
-
 #include "dtype_utils.hpp"
 
 namespace yadrakova::core
@@ -21,6 +18,33 @@ namespace yadrakova::core
 
     Strides contiguous_strides(const Shape& shape);
 
+    // ------------------------------------------------------------------
+    // Tensor<T>: datos + vistas (shape/strides/offset) + transferencias
+    // host<->device. NO conoce Executor/BackendRegistry/OpsDispatch.
+    // Las ops matematicas estan DECLARADAS aca (necesitan estar en la
+    // clase porque son metodos), definidas en tensor_ops.hpp. Cualquier
+    // .cpp que llame a t.matmul()/.gelu()/etc necesita incluir
+    // tensor_ops.hpp ademas de este header (son templates: el cuerpo
+    // tiene que ser visible en el punto de instanciacion).
+    //
+    // CONTRATO DE STREAM (importante, no forzado por el compilador):
+    // MemoryPool trackea con un cudaEvent, grabado en el stream ACTIVO al
+    // momento de destruir el buffer, cuando es seguro reciclar esa
+    // direccion de VRAM para otro Tensor. Ese evento se graba sobre el
+    // stream que estaba activo en el momento de la ALOCACION (constructor
+    // de Tensor / StreamGuard), no sobre el stream que le pases explicito
+    // a cada operacion individual (matmul/gelu/add/...).
+    //
+    // Por eso: un Tensor debe crearse y usarse SIEMPRE dentro del mismo
+    // stream/StreamGuard durante toda su vida. Si haces
+    // `StreamGuard guard(stream1); Tensor<T> A(...);` y despues llamas
+    // `A.matmul(B, Backend::Auto, stream2)` con un stream DISTINTO al de
+    // creacion, el evento de liberacion queda grabado sobre stream1 y no
+    // refleja el trabajo real que corrio en stream2 -- el pool puede
+    // reciclar la direccion de A mientras la GPU todavia esta escribiendo
+    // ahi desde stream2. No mezclar streams explicitos por-operacion con
+    // el stream de creacion del Tensor.
+    // ------------------------------------------------------------------
     template <typename T = __nv_bfloat16>
     class Tensor
     {
@@ -95,7 +119,6 @@ namespace yadrakova::core
             return host;
         }
 
-
         T* data() { return data_ptr_; }
         const T* data() const { return data_ptr_; }
         [[nodiscard]] const Shape& shape() const { return shape_; }
@@ -109,7 +132,6 @@ namespace yadrakova::core
         }
 
         [[nodiscard]] bool is_contiguous() const { return strides_ == contiguous_strides(shape_); }
-
 
         Tensor transpose(int dim0, int dim1) const
         {
@@ -155,222 +177,18 @@ namespace yadrakova::core
             return Tensor(buffer_, std::move(new_shape), contiguous_strides(new_shape), offset_);
         }
 
-        Tensor gelu(Backend backend = Backend::Auto, Stream& stream = default_stream()) const
-        {
-            if (!is_contiguous())
-                throw std::runtime_error(
-                    "gelu: non-contiguous tensor (view from transpose/permute/slice). "
-                    "Materialize a contiguous copy before applying gelu.");
+        // ------------------------------------------------------------
+        // Ops matematicas -- SOLO declaradas aca, definidas en
+        // tensor_ops.hpp. Agregar una op nueva = una linea aca.
+        // Ver contrato de stream en el comentario de la clase.
+        // ------------------------------------------------------------
+        Tensor gelu(Backend backend = Backend::Auto, Stream& stream = default_stream()) const;
+        Tensor softmax(Backend backend = Backend::Auto, Stream& stream = default_stream()) const;
+        Tensor matmul(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const;
+        Tensor add(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const;
+        Tensor mul(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const;
+        [[nodiscard]] Tensor<T> contiguous(Backend backend = Backend::Auto, Stream& stream = default_stream()) const;
 
-            Tensor<T> out(shape_);
-
-            const T* in_ptr = this->data_ptr_;
-            T* out_ptr = out.data_ptr_;
-            int64_t n = numel();
-
-            std::vector<void*> args = {&in_ptr, &out_ptr, &n};
-
-            auto resolution = OpsDispatch::resolve(Op::Gelu, dtype, backend);
-            if (resolution.backend == Backend::Custom)
-            {
-                Executor::execute<T>("gelu", DimMap{{"n", n}}, args, stream);
-            }
-            else
-            {
-                BackendRegistry::instance().invoke(Op::Gelu, resolution.backend, resolution.compute_dtype, args, stream);
-            }
-            return out;
-        }
-
-        Tensor softmax(Backend backend = Backend::Auto, Stream& stream = default_stream()) const
-        {
-            if (ndim() != 2)
-                throw std::runtime_error(
-                    "softmax: expected 2D tensor (ndim()=" + std::to_string(ndim()) + ")");
-            if (!is_contiguous())
-                throw std::runtime_error(
-                    "softmax: non-contiguous tensor (view from transpose/permute/slice). "
-                    "Materialize a contiguous copy before applying softmax.");
-
-            const int64_t rows = shape_[0];
-            const int64_t cols = shape_[1];
-
-            Tensor<T> out(shape_);
-
-            const T* in_ptr = this->data_ptr_;
-            T* out_ptr = out.data_ptr_;
-
-            std::vector<void*> args = {&in_ptr, &out_ptr, (void*)&rows, (void*)&cols};
-
-            auto resolution = OpsDispatch::resolve(Op::Softmax, dtype, backend);
-            if (resolution.backend == Backend::Custom)
-            {
-                Executor::execute<T>("softmax", DimMap{{"rows", rows}, {"cols", cols}}, args, stream);
-            }
-            else
-            {
-                BackendRegistry::instance().invoke(Op::Softmax, resolution.backend, resolution.compute_dtype, args, stream);
-            }
-            return out;
-        }
-
-        Tensor matmul(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const
-        {
-            if (ndim() != 2 || B.ndim() != 2)
-            {
-                throw std::runtime_error(
-                    "matmul: only 2D tensors supported (A.ndim()=" +
-                    std::to_string(ndim()) + ", B.ndim()=" + std::to_string(B.ndim()) + ")");
-            }
-            if (shape_[1] != B.shape_[0])
-            {
-                throw std::runtime_error(
-                    "matmul: incompatible shapes (" + std::to_string(shape_[0]) + "x" +
-                    std::to_string(shape_[1]) + ") @ (" + std::to_string(B.shape_[0]) + "x" +
-                    std::to_string(B.shape_[1]) + ")");
-            }
-            if (!is_contiguous() || !B.is_contiguous())
-            {
-                throw std::runtime_error(
-                    "matmul: both operands must be contiguous (materialize a copy "
-                    "if they come from transpose/permute/slice)");
-            }
-
-            const int64_t M = shape_[0];
-            const int64_t K = shape_[1];
-            const int64_t N = B.shape_[1];
-
-            Tensor<T> C({M, N});
-
-            const T* a_ptr = this->data_ptr_;
-            const T* b_ptr = B.data_ptr_;
-            T* c_ptr = C.data_ptr_;
-
-            std::vector<void*> args = {
-                &a_ptr, &b_ptr, &c_ptr, (void*)&M, (void*)&N, (void*)&K
-            };
-
-            auto resolution = OpsDispatch::resolve(Op::MatMul, dtype, backend);
-            if (resolution.backend == Backend::Custom)
-            {
-                Executor::execute<T>("matmul_wmma", DimMap{{"M", M}, {"N", N}, {"K", K}}, args, stream);
-            }
-            else
-            {
-                BackendRegistry::instance().invoke(Op::MatMul, resolution.backend, resolution.compute_dtype, args, stream);
-            }
-            return C;
-        }
-          Tensor add(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const
-    {
-        if (numel() != B.numel())
-            throw std::runtime_error("add: numel mismatch between operands");
-        if (!is_contiguous() || !B.is_contiguous())
-            throw std::runtime_error("add: both operands must be contiguous (materialize a copy if needed)");
-
-        Tensor<T> out(shape_);
-
-        const void* a_ptr = this->data_ptr_;
-        const void* b_ptr = B.data_ptr_;
-        void* c_ptr = out.data_ptr_;
-        int64_t n = numel();
-
-        // Conversión implícita de const void** a void* (igual que matmul)
-        std::vector<void*> args = {&a_ptr, &b_ptr, &c_ptr, &n};
-
-        auto resolution = OpsDispatch::resolve(Op::Add, dtype, backend);
-
-        if (resolution.backend == Backend::Custom)
-        {
-            Executor::execute<T>("add", DimMap{{"n", n}}, args, stream);
-        }
-        else
-        {
-            BackendRegistry::instance().invoke(Op::Add, resolution.backend, resolution.compute_dtype, args, stream);
-        }
-        return out;
-    }
-
-    Tensor mul(const Tensor<T>& B, Backend backend = Backend::Auto, Stream& stream = default_stream()) const
-    {
-        if (numel() != B.numel())
-            throw std::runtime_error("mul: numel mismatch between operands");
-        if (!is_contiguous() || !B.is_contiguous())
-            throw std::runtime_error("mul: both operands must be contiguous (materialize a copy if needed)");
-
-        Tensor<T> out(shape_);
-
-        const void* a_ptr = this->data_ptr_;
-        const void* b_ptr = B.data_ptr_;
-        void* c_ptr = out.data_ptr_;
-        int64_t n = numel();
-
-        // Conversión implícita de const void** a void* (igual que matmul)
-        std::vector<void*> args = {&a_ptr, &b_ptr, &c_ptr, &n};
-
-        auto resolution = OpsDispatch::resolve(Op::Mul, dtype, backend);
-
-        if (resolution.backend == Backend::Custom)
-        {
-            Executor::execute<T>("mul", DimMap{{"n", n}}, args, stream);
-        }
-        else
-        {
-            BackendRegistry::instance().invoke(Op::Mul, resolution.backend, resolution.compute_dtype, args, stream);
-        }
-        return out;
-    }
-        [[nodiscard]] Tensor<T> contiguous(Backend backend = Backend::Auto, Stream& stream = default_stream()) const
-        {
-            if (is_contiguous())
-            {
-                return *this; // Si ya es continuo, retornamos una copia superficial
-            }
-
-            // 1. Crear tensor destino contiguo con la misma forma
-            Tensor<T> out(shape_);
-
-            // 2. Preparar la estructura de la vista para el kernel CUDA
-            constexpr int MAX_DIMS = 8;
-            struct TensorViewInfo {
-                int64_t shape[MAX_DIMS];
-                int64_t strides[MAX_DIMS];
-                int ndim;
-            };
-
-            TensorViewInfo view_info;
-            view_info.ndim = static_cast<int>(ndim());
-            for (size_t i = 0; i < ndim(); ++i) {
-                view_info.shape[i] = shape_[i];
-                view_info.strides[i] = strides_[i];
-            }
-
-            int64_t total_elements = numel();
-
-            const T* in_ptr = this->data_ptr_;
-            T* out_ptr = out.data_ptr_;
-
-            // 3. Empaquetar argumentos para el Executor (coincidiendo con contiguous.cu)
-            std::vector<void*> args = {
-                (void*)&in_ptr,
-                (void*)&out_ptr,
-                (void*)&view_info,
-                (void*)&total_elements
-            };
-
-            // 4. Resolver backend y ejecutar mediante tu infraestructura AOT
-            auto resolution = OpsDispatch::resolve(Op::Contiguous, dtype, backend);
-            if (resolution.backend == Backend::Custom)
-            {
-                Executor::execute<T>("contiguous", DimMap{{"numel", total_elements}}, args, stream);
-            }
-            else
-            {
-                BackendRegistry::instance().invoke(Op::Contiguous, resolution.backend, resolution.compute_dtype, args, stream);
-            }
-
-            return out;
-        }
         void to_device(const T* host_ptr, size_t count)
         {
             check_contiguous_for_transfer("to_device");
@@ -378,7 +196,6 @@ namespace yadrakova::core
                 throw std::runtime_error("to_device: size mismatch");
             CUDA_CHECK(cudaMemcpy(data_ptr_, host_ptr, count * sizeof(T), cudaMemcpyHostToDevice));
         }
-
 
         void to_host(T* host_ptr, size_t count, Stream& stream = default_stream()) const
         {
