@@ -11,4 +11,4 @@ op:
     n: "input.numel()"
   checks:
     - "input.is_contiguous()"
-  backends: [CuDNN, Custom]
+  backends: [Custom]
