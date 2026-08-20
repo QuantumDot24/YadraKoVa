@@ -1,34 +1,16 @@
 #!/usr/bin/env python3
 """
-YadraKoVa kernel compiler + embedder + dispatch codegen.
+YadraKoVa kernel compiler + embedder + dispatch codegen + ops codegen.
 
-Scans src/kernels/*.cu, compiles each to .cubin (native SASS, zero
-load overhead -- no JIT) for every arch x dtype combination defined in
-config.yaml, caches by content+flags+nvcc version+shared headers hash
-to avoid unnecessary recompilation.
-
-Cache policy: ONLY the most recent version of each kernel+dtype+arch
-combination is kept. On a cache miss (the kernel changed), any old
-.cubin for that same combination is automatically deleted before
-compiling the new one -- designed for constant performance tuning
-iteration without accumulating garbage forever.
-
-Generates THREE files per kernel, separating data from side effects:
-  - include/kernels/embedded/{kernel}_embedded.cuh
-        Data only (byte arrays). Pure header, no side effects.
-  - generated/kernels/{kernel}_registration.cpp
-        Side effect: static registration in KernelRegistry
-        (name -> CUfunction). Lives OUTSIDE include/, in the build
-        dir, generated and discardable.
-  - generated/kernels/{kernel}_dispatch.generated.cpp   [NEW]
-        Side effect: static registration in DispatchRegistry
-        (name -> grid/block computation rule), derived from
-        src/kernels/{kernel}.yaml. If the .yaml doesn't exist, it's
-        skipped with a warning -- allows migrating kernels one by one.
-
-The dispatch .yaml lives next to the .cu (same stem, same folder) and
-does NOT participate in the cubin compilation cache hash: changing only
-the dispatch rule should not force a CUDA recompilation.
+Genera automáticamente:
+  - include/kernels/embedded/{kernel}_embedded.cuh  (datos: cubins embebidos)
+  - generated/kernels/{kernel}_registration.cpp     (registro en KernelRegistry)
+  - generated/kernels/{kernel}_dispatch.generated.cpp (registro en DispatchRegistry)
+  - generated/ops/{kernel}_ops.hpp                  (función libre + wrapper Tensor)
+  - generated/ops/ops_metadata.hpp                  (enum Op + op_name + kNumOps)
+  - generated/ops/ops_caps.hpp                      (BackendCaps: preference_order + supported_dtypes)
+  - generated/ops/all_ops.hpp                       (include maestro de todos los *_ops.hpp)
+  - generated/ops/tensor_declarations.hpp           (declaraciones para incluir DENTRO de Tensor<T>)
 """
 import argparse
 import hashlib
@@ -36,7 +18,7 @@ import os
 import re
 import subprocess
 import sys
-import yaml  # pip install pyyaml
+import yaml
 from pathlib import Path
 
 DTYPE_TO_CPP = {
@@ -57,6 +39,9 @@ ARCH_TO_SM = {"sm_86": "86", "sm_100": "100"}
 ARCH_TO_ENUM = {"sm_86": "Arch::SM_86", "sm_100": "Arch::SM_100"}
 
 
+# =========================================================================
+# Utilidades de cache y compilación
+# =========================================================================
 def sha256_of(*parts: str) -> str:
     h = hashlib.sha256()
     for p in parts:
@@ -69,11 +54,6 @@ def nvcc_version() -> str:
 
 
 def hash_shared_headers(shared_headers_dir: Path) -> str:
-    """Combined hash of ALL shared .cuh headers in include/kernels/
-    (common.cuh, etc. -- not the generated ones in embedded/, those are
-    output, not input). Intentionally conservative: if ANY shared header
-    changes, invalidates the cache of ALL kernels. Safer than an #include
-    parser that can fail silently."""
     h = hashlib.sha256()
     if not shared_headers_dir.exists():
         return h.hexdigest()
@@ -84,12 +64,6 @@ def hash_shared_headers(shared_headers_dir: Path) -> str:
 
 def prune_old_versions(source: Path, dtype: str, arch: str,
                        cache_dir: Path, keep_path: Path):
-    """Deletes any old .cubin for this SAME kernel+dtype+arch combination
-    (different hash = previous version of the same file). Called ONLY on
-    cache miss, just before compiling the new version -- guarantees that
-    .kernel_cache/ never accumulates more than one version per
-    combination, regardless of how many times the kernel is iterated
-    during tuning."""
     if not cache_dir.exists():
         return
     prefix = f"{source.stem}_{dtype}_{arch}_"
@@ -100,19 +74,14 @@ def prune_old_versions(source: Path, dtype: str, arch: str,
 
 
 def extract_kernel_name(cubin_stem: str, known_dtypes: set) -> str:
-    """Extracts kernel name from a cubin stem that may contain dtype.
-    Looks for pattern '_<dtype>_' and takes everything before it."""
     for dtype in known_dtypes:
         marker = f"_{dtype}_"
         if marker in cubin_stem:
             return cubin_stem[:cubin_stem.index(marker)]
-    # fallback: split by '_' and hope there's no dtype in the name (unreliable)
     return cubin_stem.split("_")[0]
 
 
 def prune_orphaned_kernels(cache_dir: Path, valid_kernel_names: set, known_dtypes: set):
-    """Deletes .cubin files whose kernel .cu no longer exists (renamed or
-    deleted). Called ONCE at the end, over the entire cache."""
     if not cache_dir.exists():
         return
     removed = 0
@@ -152,15 +121,16 @@ def compile_one(source: Path, dtype: str, arch: str, cache_dir: Path,
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         print(f"  [ERROR nvcc] {source.name} dtype={dtype} arch={arch}", file=sys.stderr)
-        if e.stdout:
-            print(e.stdout, file=sys.stderr)
-        if e.stderr:
-            print(e.stderr, file=sys.stderr)
+        if e.stdout: print(e.stdout, file=sys.stderr)
+        if e.stderr: print(e.stderr, file=sys.stderr)
         raise
 
     return cubin_path
 
 
+# =========================================================================
+# Generación de .cuh (datos) y .cpp de registro
+# =========================================================================
 def embed_cubin_bytes(cubin_path: Path, var_name: str) -> str:
     data = cubin_path.read_bytes()
     lines = [f"inline constexpr unsigned char {var_name}[] = {{"]
@@ -174,12 +144,10 @@ def embed_cubin_bytes(cubin_path: Path, var_name: str) -> str:
 
 def write_cuh(kernel_name: str, archs: list, dtypes: list,
               cubins: dict, cuh_path: Path):
-    """Writes the .cuh -- data ONLY, zero side effects."""
     lines = [
         "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
         f"// Source: src/kernels/{kernel_name}.cu",
-        "// Data only (embedded cubins). No side effects --",
-        "// safe to include from any translation unit.",
+        "// Data only (embedded cubins). No side effects.",
         "#pragma once",
         "#include <cstddef>",
         "",
@@ -192,7 +160,6 @@ def write_cuh(kernel_name: str, archs: list, dtypes: list,
             lines.append(embed_cubin_bytes(cubins[(arch, dtype)], var))
         lines.append(f"}} // namespace {arch}")
     lines.append("} // namespace yadrakova::embedded")
-
     cuh_path.parent.mkdir(parents=True, exist_ok=True)
     cuh_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -200,16 +167,11 @@ def write_cuh(kernel_name: str, archs: list, dtypes: list,
 def write_registration_cpp(kernel_name: str, archs: list, dtypes: list,
                            cuh_path: Path, registration_cpp_path: Path,
                            registry_header: Path):
-    """Writes the registration .cpp -- ONLY the side effect.
-    Lives outside include/, in the build dir."""
     cuh_include = Path(os.path.relpath(cuh_path, registration_cpp_path.parent)).as_posix()
     registry_include = Path(os.path.relpath(registry_header, registration_cpp_path.parent)).as_posix()
 
     lines = [
         "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
-        "// Side effect: static registration in KernelRegistry.",
-        "// Lives outside include/ on purpose -- a .cpp with side",
-        "// effects does not belong in the header tree.",
         f'#include "{cuh_include}"',
         f'#include "{registry_include}"',
         "",
@@ -231,26 +193,59 @@ def write_registration_cpp(kernel_name: str, archs: list, dtypes: list,
         f"{kernel_name.capitalize()}Registrar instance;",
         "} // namespace",
     ]
-
     registration_cpp_path.parent.mkdir(parents=True, exist_ok=True)
     registration_cpp_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-# --------------------------------------------------------------------------
-# NEW: dispatch codegen (grid/block) from src/kernels/{k}.yaml
-# --------------------------------------------------------------------------
+# =========================================================================
+# Parseo de firma del kernel y YAML
+# =========================================================================
+SIG_RE = re.compile(
+    r'extern\s+"C"\s+__global__\s+void\s+(\w+)\s*\((.*?)\)\s*\{',
+    re.DOTALL
+)
 
+# Fallback si no tiene extern "C"
+SIG_RE_FALLBACK = re.compile(
+    r'__global__\s+void\s+(\w+)\s*\((.*?)\)\s*\{',
+    re.DOTALL
+)
+
+
+def parse_kernel_signature(source_text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Returns (kernel_function_name, [(cpp_type, name), ...])."""
+    m = SIG_RE.search(source_text) or SIG_RE_FALLBACK.search(source_text)
+    if not m:
+        raise ValueError("Could not find __global__ void ...(...) { in the kernel")
+    fn_name = m.group(1)
+    params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+    result = []
+    for p in params:
+        parts = p.replace("*", " * ").split()
+        name = parts[-1]
+        type_str = " ".join(parts[:-1]).replace(" * ", "*").strip()
+        result.append((type_str, name))
+    return fn_name, result
+
+
+def infer_dim_names(sig: list[tuple[str, str]]) -> list[str]:
+    """Infiere los nombres de dimensiones (escalares) del signature del kernel.
+    Un escalar es cualquier argumento que NO sea un puntero."""
+    return [name for typ, name in sig if "*" not in typ]
+
+
+def find_dispatch_yaml(source: Path) -> Path | None:
+    yaml_path = source.with_suffix(".yaml")
+    return yaml_path if yaml_path.exists() else None
+
+
+# =========================================================================
+# Grid helpers
+# =========================================================================
 def _ceildiv_expr(numer: str, denom: int) -> str:
-    """ceil(numer/denom) in integer arithmetic, no floats. numer is a
-    variable name (M, N, K, or any dim name) that exists as an int64_t
-    parameter of the generated dispatch function; denom is a literal
-    (block size), known at generation time."""
     return f"(({numer} + {denom} - 1) / {denom})"
 
 
-# Each helper declares which grid dimensions (x/y/z) each of its
-# positional arguments maps to. tile2d(rows, columns) is the common
-# case of "one thread per element of a 2D output matrix".
 GRID_HELPERS = {
     "tile2d": ("y", "x"),
     "rows": ("y",),
@@ -260,9 +255,6 @@ GRID_HELPERS = {
 
 
 def parse_grid_spec(grid_field, block: list, dim_names: list) -> dict:
-    """Returns {'x': cpp_expr, 'y': cpp_expr, 'z': cpp_expr}, expressed
-    in terms of the dimension names declared in the YAML (dim_names),
-    with the block size already resolved as an integer literal."""
     dims = {"x": "1", "y": "1", "z": "1"}
     block_by_dim = {"x": block[0], "y": block[1], "z": block[2] if len(block) > 2 else 1}
 
@@ -285,93 +277,28 @@ def parse_grid_spec(grid_field, block: list, dim_names: list) -> dict:
         for var_name, dim in zip(arg_names, target_dims):
             if var_name not in dim_names:
                 raise ValueError(
-                    f"grid: '{var_name}' is not declared in 'dims: {dim_names}' -- check {grid_field}"
+                    f"grid: '{var_name}' is not a scalar in the kernel signature."
                 )
             dims[dim] = _ceildiv_expr(var_name, block_by_dim[dim])
         return dims
 
     if isinstance(grid_field, dict):
-        # Explicit form, fallback for cases that don't fit a helper:
-        # each component is a hand-written C++ expression, free to use
-        # the dimension names from dims.
         for dim in ("x", "y", "z"):
             if dim in grid_field:
                 dims[dim] = str(grid_field[dim])
         return dims
 
-    raise ValueError(f"grid: unsupported type ({type(grid_field).__name__}); use string or dict")
+    raise ValueError(f"grid: unsupported type ({type(grid_field).__name__})")
 
 
-def find_dispatch_yaml(source: Path) -> Path | None:
-    yaml_path = source.with_suffix(".yaml")
-    return yaml_path if yaml_path.exists() else None
-
-
-SIG_RE = re.compile(
-    r'__global__\s+void\s+\w+_kernel\s*\((.*?)\)\s*\{',
-    re.DOTALL
-)
-
-
-def parse_kernel_signature(source_text: str) -> list[tuple[str, str]]:
-    """Returns [(cpp_type, name), ...] in order, from the actual signature."""
-    m = SIG_RE.search(source_text)
-    if not m:
-        raise ValueError("Could not find __global__ ...(...) { in the kernel")
-    params = [p.strip() for p in m.group(1).split(",") if p.strip()]
-    result = []
-    for p in params:
-        parts = p.replace("*", " * ").split()
-        name = parts[-1]
-        type_str = " ".join(parts[:-1]).replace(" * ", "*").strip()
-        result.append((type_str, name))
-    return result
-
-
-def validate_args_match(kernel_name: str, source_text: str, yaml_args: list):
-    real_sig = parse_kernel_signature(source_text)
-    if len(real_sig) != len(yaml_args):
-        raise ValueError(
-            f"'{kernel_name}': YAML declares {len(yaml_args)} args, "
-            f"actual signature has {len(real_sig)}"
-        )
-    for (real_type, real_name), decl in zip(real_sig, yaml_args):
-        if real_name != decl["name"]:
-            raise ValueError(
-                f"'{kernel_name}': order/name mismatch -- YAML says "
-                f"'{decl['name']}', actual signature says '{real_name}'"
-            )
-        if decl["kind"] in ("in", "out") and "*" not in real_type:
-            raise ValueError(
-                f"'{kernel_name}.{real_name}': YAML says kind={decl['kind']} "
-                f"(should be a pointer) but actual signature is '{real_type}'"
-            )
-        expected_scalar = {"int64": "int64_t", "int32": "int"}.get(decl.get("dtype", ""))
-        if decl["kind"] == "scalar" and expected_scalar and expected_scalar not in real_type:
-            raise ValueError(
-                f"'{kernel_name}.{real_name}': YAML declares dtype={decl['dtype']} "
-                f"but actual signature is '{real_type}'"
-            )
-
-
+# =========================================================================
+# Generación de dispatch.generated.cpp
+# =========================================================================
 def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
                        dispatch_cpp_path: Path, dispatch_registry_header: Path):
-    """Writes the dispatch registration .cpp. Now validates YAML vs
-    actual signature BEFORE generating, and builds the lambda over
-    DimMap instead of fixed positional M,N,K."""
-    if kernel_yaml.get("kernel", kernel_name) != kernel_name:
-        print(f"  [WARN] 'kernel:' in YAML does not match the file name "
-              f"({kernel_yaml.get('kernel')!r} vs {kernel_name!r})", file=sys.stderr)
-
-    dim_names = kernel_yaml.get("dims")
-    if not dim_names:
-        raise ValueError(f"'{kernel_name}.yaml' does not define 'dims:' (e.g., [M, N, K] or [n])")
-
-    yaml_args = kernel_yaml.get("args")
-    if not yaml_args:
-        raise ValueError(f"'{kernel_name}.yaml' does not define 'args:'")
-
-    validate_args_match(kernel_name, source_text, yaml_args)
+    # Inferir dimensiones del signature del kernel (YAML minimalista)
+    _, sig = parse_kernel_signature(source_text)
+    dim_names = infer_dim_names(sig)
 
     block = list(kernel_yaml.get("block", [1, 1, 1]))
     while len(block) < 3:
@@ -398,7 +325,7 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
 
     lines = [
         "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
-        f"// Dispatch rule for '{kernel_name}', derived from src/kernels/{kernel_name}.yaml",
+        f"// Dispatch rule for '{kernel_name}', inferred from kernel signature.",
         f'#include "{registry_include}"',
         "",
         f"namespace yadrakova::kernels::dispatch_{kernel_name} {{",
@@ -425,17 +352,204 @@ def write_dispatch_cpp(kernel_name: str, kernel_yaml: dict, source_text: str,
         "",
         "} // namespace",
     ]
-
     dispatch_cpp_path.parent.mkdir(parents=True, exist_ok=True)
     dispatch_cpp_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# =========================================================================
+# Generación de ops de alto nivel (API de Tensor)
+# =========================================================================
+def generate_op_hpp(kernel_name: str, op_meta: dict, sig: list, output_dir: Path):
+    """Genera la función libre y el wrapper de Tensor::method para una op."""
+    op_name = op_meta.get("name", kernel_name.capitalize())
+    inputs = op_meta.get("inputs", [])
+    output = op_meta.get("output", "out")
+    checks = op_meta.get("checks", [])
+    scalar_inits = op_meta.get("scalar_init", {})
+
+    # Identificar escalares (no punteros) del signature
+    scalar_args = [name for typ, name in sig if "*" not in typ]
+
+    # Construir checks
+    check_code = "\n".join([
+        f'    if (!({check})) throw std::runtime_error("{op_name.lower()}: validation failed ({check})");'
+        for check in checks
+    ])
+
+    # DimMap entries
+    dim_map_entries = [f'{{"{name}", {name}}}' for name in scalar_args]
+
+    # Args para el kernel (punteros y escalares)
+    args_entries = []
+    for typ, name in sig:
+        if name in inputs or name == output:
+            args_entries.append(f'&{name.lower()}_ptr')
+        else:
+            args_entries.append(f'&{name}')
+
+    # Punteros de entrada/salida
+    input_ptrs = [f'    const T* {name.lower()}_ptr = {name}.data();' for name in inputs]
+    output_ptr = f'    T* {output.lower()}_ptr = {output.lower()}.data();'
+    out_shape = f"{inputs[0]}.shape()" if inputs else "in.shape()"
+
+    # Parámetros de la función libre
+    input_params = ", ".join([f"const Tensor<T>& {inp}" for inp in inputs])
+    func_params = f"{input_params}, Backend backend, Stream& stream" if input_params else "Backend backend, Stream& stream"
+
+    lines = [
+        "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
+        "#pragma once",
+        '#include "core/tensor.hpp"',
+        '#include "core/backend_dispatch.hpp"',
+        "",
+        "namespace yadrakova::core {",
+        "",
+        f"// Función libre para {op_name}",
+        f"template <typename T>",
+        f"Tensor<T> {op_name.lower()}({func_params}) {{",
+    ]
+
+    if check_code:
+        lines.append(check_code)
+
+    # Declaraciones de escalares con inicialización
+    scalar_decls = []
+    for typ, name in sig:
+        if name in scalar_args:
+            if name in scalar_inits:
+                scalar_decls.append(f"    {typ} {name} = {scalar_inits[name]};")
+            else:
+                scalar_decls.append(f"    {typ} {name} = 0; // WARNING: Add '{name}' to scalar_init in YAML")
+
+    lines.extend([
+                     "",
+                     f"    Tensor<T> {output.lower()}({out_shape});",
+                 ] + input_ptrs + [
+                     f"    {output_ptr}",
+                 ] + scalar_decls + [
+                     "",
+                     f"    std::vector<void*> args = {{ {', '.join(args_entries)} }};",
+                     f"    dispatch_op<T>(Op::{op_name}, \"{kernel_name}\", DimMap{{{', '.join(dim_map_entries)}}}, args, backend, stream);",
+                     f"    return {output.lower()};",
+                     "}",
+                     "",
+                     f"// Wrapper del método de Tensor",
+                     f"template <typename T>",
+                 ])
+
+    if len(inputs) > 1:
+        method_params = ", ".join([f"const Tensor<T>& {inp}" for inp in inputs[1:]] + ["Backend backend", "Stream& stream"])
+        method_args = ", ".join([inp for inp in inputs[1:]] + ["backend", "stream"])
+        lines.append(f"Tensor<T> Tensor<T>::{op_name.lower()}({method_params}) const {{")
+        lines.append(f"    return yadrakova::core::{op_name.lower()}(*this, {method_args});")
+    else:
+        lines.append(f"Tensor<T> Tensor<T>::{op_name.lower()}(Backend backend, Stream& stream) const {{")
+        lines.append(f"    return yadrakova::core::{op_name.lower()}(*this, backend, stream);")
+
+    lines.extend(["}", "", "} // namespace yadrakova::core"])
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / f"{kernel_name}_ops.hpp").write_text("\n".join(lines), encoding="utf-8")
+
+
+def generate_global_op_files(all_ops_meta: list, output_dir: Path):
+    """Genera los archivos globales: enum Op, capacidades, includes maestros."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ops que hacen dispatch manual (escritas a mano en tensor.hpp, no siguen
+    # el patrón genérico de generate_op_hpp) pero igual necesitan un valor
+    # en el enum Op porque se llaman via dispatch_op<T>(Op::X, ...).
+    # Estas NO generan wrapper de alto nivel ni entran en tensor_declarations.hpp.
+    MANUAL_OPS = [{"name": "Contiguous"}]
+
+    # all_ops_meta = ops autogeneradas (con sección 'op:' en su .yaml, ej.
+    # Add/Mul/MatMul/Softmax). enum_ops = unión, solo para el enum y op_name.
+    enum_ops = MANUAL_OPS + all_ops_meta
+
+    # 1. ops_metadata.hpp (enum Op + kNumOps + op_name)
+    meta_lines = [
+        "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
+        "#pragma once",
+        "#include <cstdint>",
+        "#include <string>",
+        "#include <stdexcept>",
+        "",
+        "namespace yadrakova::core {",
+        "",
+        "enum class Op : uint8_t {"
+    ]
+    enum_entries = [f"    {op['name']} = {i}" for i, op in enumerate(enum_ops)]
+    meta_lines.extend([",\n".join(enum_entries), "};", ""])
+    meta_lines.append(f"inline constexpr size_t kNumOps = {len(enum_ops)};")
+    meta_lines.append("")
+    meta_lines.append("inline const char* op_name(Op op) {")
+    meta_lines.append("    switch (op) {")
+    for op in enum_ops:
+        meta_lines.append(f"        case Op::{op['name']}: return \"{op['name'].lower()}\";")
+    meta_lines.extend(["    }", '    throw std::runtime_error("op_name: Op desconocido");', "}", "", "} // namespace yadrakova::core"])
+    (output_dir / "ops_metadata.hpp").write_text("\n".join(meta_lines), encoding="utf-8")
+
+    # 2. ops_caps.hpp (preference_order + supported_dtypes)
+    caps_lines = [
+        "// AUTO-GENERATED by scripts/compile_kernel.py -- DO NOT EDIT BY HAND.",
+        "#pragma once",
+        '#include "core/backend.hpp"',   # trae Op, Backend
+        '#include "dtype_utils.hpp"',    # trae DType, DTypeMask, dtype_bit, kAllDTypes
+        "#include <vector>",
+        "",
+        "namespace yadrakova::core {",
+        "",
+        "inline const std::vector<Backend>& get_preference_order(Op op) {"
+    ]
+    # Ops manuales (ej. Contiguous) siempre son Custom-only: no tienen
+    # sección 'op:' ni lista de 'backends' en su yaml, así que no entran
+    # al loop de abajo (que usa all_ops_meta) -- caen directo al default/fallback.
+    for op in all_ops_meta:
+        backends = op.get("backends", ["Custom"])
+        backend_list = ", ".join([f"Backend::{b}" for b in backends])
+        caps_lines.append(f"    static const std::vector<Backend> {op['name'].lower()}_order = {{{backend_list}}};")
+    caps_lines.append("    switch (op) {")
+    for op in all_ops_meta:
+        caps_lines.append(f"        case Op::{op['name']}: return {op['name'].lower()}_order;")
+    caps_lines.extend(["    default: break;", "    }", "    static const std::vector<Backend> custom_only = {Backend::Custom};", "    return custom_only;", "}"])
+    caps_lines.append("")
+    caps_lines.append("inline DTypeMask get_supported_dtypes(Op op, Backend backend) {")
+    caps_lines.append("    if (backend == Backend::Custom) return kAllDTypes;")
+    caps_lines.append("    switch (op) {")
+    for op in all_ops_meta:
+        caps_lines.append(f"        case Op::{op['name']}:")
+        caps_lines.append("            if (backend == Backend::CuBLAS || backend == Backend::CuTensor || backend == Backend::CuDNN || backend == Backend::CuRAND)")
+        caps_lines.append("                return dtype_bit(DType::BF16) | dtype_bit(DType::FP32) | dtype_bit(DType::FP16);")
+        caps_lines.append("            break;")
+    caps_lines.extend(["    default: break;", "    }", "    return 0;", "}", "", "} // namespace yadrakova::core"])
+    (output_dir / "ops_caps.hpp").write_text("\n".join(caps_lines), encoding="utf-8")
+
+    # 3. all_ops.hpp (include maestro)
+    all_ops_lines = ["// AUTO-GENERATED", "#pragma once"]
+    for op in all_ops_meta:
+        all_ops_lines.append(f'#include "{op["kernel_name"]}_ops.hpp"')
+    (output_dir / "all_ops.hpp").write_text("\n".join(all_ops_lines), encoding="utf-8")
+
+    # 4. tensor_declarations.hpp (para incluir DENTRO de la clase Tensor)
+    decl_lines = ["// AUTO-GENERATED: Incluir DENTRO de la clase Tensor"]
+    for op in all_ops_meta:
+        inputs = op.get("inputs", [])
+        if len(inputs) > 1:
+            args = ", ".join([f"const Tensor<T>& {inp}" for inp in inputs[1:]] + ["Backend backend = Backend::Auto", "Stream& stream = default_stream()"])
+            decl_lines.append(f"    Tensor<T> {op['name'].lower()}({args}) const;")
+        else:
+            decl_lines.append(f"    Tensor<T> {op['name'].lower()}(Backend backend = Backend::Auto, Stream& stream = default_stream()) const;")
+    (output_dir / "tensor_declarations.hpp").write_text("\n".join(decl_lines), encoding="utf-8")
+
+
+# =========================================================================
+# main()
+# =========================================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--output-dir", default=None,
-                        help="Override for the output directory of the registration "
-                             ".cpp files (used by CMake to point to the build dir)")
+                        help="Override for the output directory of the registration .cpp files")
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -446,14 +560,10 @@ def main():
     src_dir = Path(config["kernels"]["source_dir"])
     cuh_out_dir = Path(config["kernels"]["output_dir"])
     cpp_out_dir = Path(args.output_dir) if args.output_dir else Path("generated/kernels")
-    registry_header = Path(config["kernels"].get("registry_header", "include/kernels/registry.hpp")).resolve()
-    dispatch_registry_header = Path(
-        config["kernels"].get("dispatch_registry_header", "include/core/executor.hpp")
-    ).resolve()
-    cache_dir = Path(config["cache"]["dir"])
 
-    # Shared headers directory (common.cuh, etc.) -- same level as
-    # registry.hpp, used both for nvcc -I and for the invalidation hash.
+    registry_header = Path(config["kernels"].get("registry_header", "include/kernels/registry.hpp")).resolve()
+    dispatch_registry_header = Path(config["kernels"].get("dispatch_registry_header", "include/core/executor.hpp")).resolve()
+    cache_dir = Path(config["cache"]["dir"])
     shared_headers_dir = Path("include/kernels")
     include_dirs = [Path("include")]
 
@@ -470,6 +580,13 @@ def main():
 
     shared_headers_hash = hash_shared_headers(shared_headers_dir)
 
+    # Directorio de ops generadas
+    ops_output_dir = cpp_out_dir.parent / "ops"
+    ops_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Lista para recolectar metadatos de todas las ops
+    all_ops_meta = []
+
     for source in sources:
         kernel_name = source.stem
         print(f"[kernel] {kernel_name}")
@@ -481,9 +598,8 @@ def main():
                 kernel_yaml = yaml.safe_load(f)
 
         kernel_dtypes = kernel_yaml.get("dtypes", dtypes) if kernel_yaml else dtypes
-        if kernel_dtypes != dtypes:
-            print(f"  [dtypes override] {kernel_name}: {kernel_dtypes} ...")
 
+        # Compilar cubins
         cubins = {}
         for arch in archs:
             extra_flags = config["cuda"]["arch_flags"].get(arch, {}).get("extra_flags", [])
@@ -494,10 +610,8 @@ def main():
 
         cuh_path = cuh_out_dir / f"{kernel_name}_embedded.cuh"
         cpp_path = cpp_out_dir / f"{kernel_name}_registration.cpp"
-
         write_cuh(kernel_name, archs, kernel_dtypes, cubins, cuh_path)
         write_registration_cpp(kernel_name, archs, kernel_dtypes, cuh_path, cpp_path, registry_header)
-
         print(f"  -> {cuh_path}")
         print(f"  -> {cpp_path}")
 
@@ -509,7 +623,22 @@ def main():
             write_dispatch_cpp(kernel_name, kernel_yaml, source_text, dispatch_cpp_path, dispatch_registry_header)
             print(f"  -> {dispatch_cpp_path}")
 
-    # Final prune: kernels renamed/deleted since the last run.
+            # Si el YAML tiene sección 'op:', generar la API de alto nivel
+            if "op" in kernel_yaml:
+                op_meta = kernel_yaml["op"].copy()
+                op_meta["kernel_name"] = kernel_name
+                all_ops_meta.append(op_meta)
+
+                _, sig = parse_kernel_signature(source_text)
+                generate_op_hpp(kernel_name, op_meta, sig, ops_output_dir)
+                print(f"  -> {ops_output_dir}/{kernel_name}_ops.hpp")
+
+    # Generar archivos globales de Ops al final
+    if all_ops_meta:
+        generate_global_op_files(all_ops_meta, ops_output_dir)
+        print(f"[ops] Generated global metadata, caps, and declarations in {ops_output_dir}")
+
+    # Prune final
     valid_names = {s.stem for s in sources}
     prune_orphaned_kernels(cache_dir, valid_names, set(dtypes))
 

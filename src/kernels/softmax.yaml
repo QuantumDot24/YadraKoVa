@@ -1,21 +1,17 @@
-# src/kernels/softmax.yaml
-kernel: softmax
-
+dtypes: [bf16, fp32, fp16]
 block: [32, 1, 1]
-
-dims: [rows, cols]
-grid: { x: rows }
-
+grid:
+  x: rows
 shared_mem_bytes: 0
 
-args:
-  - name: input
-    kind: in
-  - name: output
-    kind: out
-  - name: rows
-    kind: scalar
-    dtype: int64
-  - name: cols
-    kind: scalar
-    dtype: int64
+op:
+  name: Softmax
+  inputs: [input]
+  output: output
+  scalar_init:
+    rows: "input.shape()[0]"
+    cols: "input.shape()[1]"
+  checks:
+    - "input.ndim() == 2"
+    - "input.is_contiguous()"
+  backends: [CuDNN, Custom]

@@ -10,6 +10,21 @@ namespace yadrakova::core
 {
     enum class DType : uint8_t { BF16, FP32, FP16, INT8 };
 
+    // --- Bitmask de dtypes soportados por un backend/op ---
+    using DTypeMask = uint32_t;
+
+    constexpr DTypeMask dtype_bit(DType dt)
+    {
+        return DTypeMask{1} << static_cast<uint8_t>(dt);
+    }
+
+    inline constexpr DTypeMask kAllDTypes =
+        dtype_bit(DType::BF16) | dtype_bit(DType::FP32) |
+        dtype_bit(DType::FP16) | dtype_bit(DType::INT8);
+
+    // Dtype al que se hace fallback cuando un backend externo (cuBLAS/cuDNN/...)
+    // no soporta el dtype pedido. BF16 porque es el tipo default de Tensor<T = __nv_bfloat16>.
+    inline constexpr DType kDefaultDType = DType::BF16;
     template <typename T>
     struct dtype_traits;
 

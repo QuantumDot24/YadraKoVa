@@ -1,5 +1,4 @@
 #include "core/tensor.hpp"
-#include "core/tensor_ops.hpp" 
 namespace yadrakova::core
 {
     Strides contiguous_strides(const Shape& shape)

@@ -1,0 +1,14 @@
+dtypes: [bf16, fp32, fp16, int8]
+block: [256, 1, 1]
+grid: elementwise(n)
+shared_mem_bytes: 0
+
+op:
+  name: Add
+  inputs: [a, b]
+  output: c
+  checks:
+    - "a.shape() == b.shape()"
+  scalar_init:
+    n: "a.numel()"
+  backends: [CuTensor, Custom]

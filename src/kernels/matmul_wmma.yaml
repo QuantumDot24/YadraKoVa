@@ -1,24 +1,21 @@
-kernel: matmul_wmma
+# src/kernels/matlum_wmma.yaml
 dtypes: [bf16, fp16]
 block: [256, 1, 1]
-dims: [M, N, K]
 grid:
   x: "((N + 63) / 64)"
   y: "((M + 127) / 128)"
 shared_mem_bytes: 0
-args:
-  - name: A
-    kind: in
-  - name: B
-    kind: in
-  - name: C
-    kind: out
-  - name: M
-    kind: scalar
-    dtype: int64
-  - name: N
-    kind: scalar
-    dtype: int64
-  - name: K
-    kind: scalar
-    dtype: int64
+
+op:
+  name: MatMul
+  inputs: [A, B]
+  output: C
+  scalar_init:
+    M: "A.shape()[0]"
+    K: "A.shape()[1]"
+    N: "B.shape()[1]"
+  checks:
+    - "A.ndim() == 2 && B.ndim() == 2"
+    - "A.shape()[1] == B.shape()[0]"
+    - "A.is_contiguous() && B.is_contiguous()"
+  backends: [CuBLAS, CuTensor, Custom]

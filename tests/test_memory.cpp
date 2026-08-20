@@ -1,5 +1,4 @@
 #include "core/tensor.hpp"
-#include "core/tensor_ops.hpp"
 #include "core/stream.hpp"
 #include "core/memory.hpp"
 #include <iostream>
@@ -313,7 +312,7 @@ int main()
         test_host_buffer_move_semantics();
 
         std::cout << "\n-- Tensor <-> Host synchronization --\n";
-        test_tensor_sync_roundtrip();
+         test_tensor_sync_roundtrip();
         test_tensor_sync_roundtrip_raw_ptr();
         test_tensor_size_mismatch_throws();
         test_tensor_async_transfer();

@@ -106,25 +106,37 @@ list(REMOVE_ITEM YADRAKOVA_TEST_SOURCES
 file(GLOB KERNEL_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.cu")
 file(GLOB_RECURSE KERNEL_YAML_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/kernels/*.yaml")
 file(GLOB SHARED_KERNEL_HEADERS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/include/kernels/*.cuh")
-
 # ---------------------------------------------------------------------------
 # 4. Kernel Codegen
 # ---------------------------------------------------------------------------
 set(KERNEL_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/kernels")
+set(OPS_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/ops")
 set(KERNEL_GENERATED_SOURCES "")
+
+file(MAKE_DIRECTORY "${OPS_GENERATED_DIR}")
 
 foreach(kernel_src ${KERNEL_SOURCES})
     get_filename_component(kernel_name ${kernel_src} NAME_WE)
     get_filename_component(kernel_dir ${kernel_src} DIRECTORY)
 
-    list(APPEND KERNEL_GENERATED_SOURCES "${KERNEL_GENERATED_DIR}/${kernel_name}_registration.cpp")
+    list(APPEND KERNEL_GENERATED_SOURCES
+            "${KERNEL_GENERATED_DIR}/${kernel_name}_registration.cpp")
 
     if(EXISTS "${kernel_dir}/${kernel_name}.yaml")
-        list(APPEND KERNEL_GENERATED_SOURCES "${KERNEL_GENERATED_DIR}/${kernel_name}_dispatch.generated.cpp")
+        list(APPEND KERNEL_GENERATED_SOURCES
+                "${KERNEL_GENERATED_DIR}/${kernel_name}_dispatch.generated.cpp")
     else()
-        message(STATUS "YadraKoVa -- '${kernel_name}' without dispatch .yaml, not yet migrated")
+        message(STATUS "YadraKoVa -- '${kernel_name}' without .yaml")
     endif()
 endforeach()
+
+# Headers generados de ops (solo existen si algún YAML tiene sección op:)
+list(APPEND KERNEL_GENERATED_SOURCES
+        "${OPS_GENERATED_DIR}/ops_metadata.hpp"
+        "${OPS_GENERATED_DIR}/ops_caps.hpp"
+        "${OPS_GENERATED_DIR}/all_ops.hpp"
+        "${OPS_GENERATED_DIR}/tensor_declarations.hpp"
+)
 
 add_custom_command(
         OUTPUT ${KERNEL_GENERATED_SOURCES}
@@ -133,8 +145,9 @@ add_custom_command(
         --output-dir ${KERNEL_GENERATED_DIR}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         DEPENDS ${KERNEL_SOURCES} ${KERNEL_YAML_FILES} ${SHARED_KERNEL_HEADERS}
-        ${CMAKE_SOURCE_DIR}/scripts/compile_kernel.py ${CMAKE_SOURCE_DIR}/config.yaml
-        COMMENT "Compiling kernels and generating registration + dispatch (.cu/.yaml -> .cubin -> .cuh + .cpp)"
+        ${CMAKE_SOURCE_DIR}/scripts/compile_kernel.py
+        ${CMAKE_SOURCE_DIR}/config.yaml
+        COMMENT "Compiling kernels + generating ops"
         VERBATIM
 )
 
@@ -148,6 +161,7 @@ add_library(yadrakova_core STATIC
 
 target_include_directories(yadrakova_core PUBLIC
         ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}   # <-- CRUCIAL: para #include "generated/ops/..."
 )
 
 set_target_properties(yadrakova_core PROPERTIES
@@ -164,7 +178,6 @@ target_link_libraries(yadrakova_core PUBLIC
         CUTENSOR::cutensor
         PahoMqttCpp::paho-mqttpp3
 )
-
 # ---------------------------------------------------------------------------
 # 6. Tests
 # ---------------------------------------------------------------------------
@@ -173,12 +186,15 @@ enable_testing()
 # Pre-fetch DLL paths for Windows runtime (cuTENSOR 2.x aware)
 if(WIN32)
     # --- cuDNN DLLs ---
-    get_filename_component(_cudnn_lib_dir "${CUDNN_LIBRARY}" DIRECTORY)
-    set(_cudnn_bin_dir "${_cudnn_lib_dir}/../bin")
-    if(EXISTS "${_cudnn_bin_dir}/cudnn64_9.dll")
-        set(CUDNN_RUNTIME_DLLS "${_cudnn_bin_dir}/cudnn64_9.dll")
-    else()
-        file(GLOB CUDNN_RUNTIME_DLLS "${_cudnn_bin_dir}/cudnn*.dll" "${_cudnn_lib_dir}/cudnn*.dll")
+    # CUDNN_INCLUDE_DIR es ROOT/include; las .dll de cuDNN 9 en Windows
+    # viven en ROOT/bin/x64 (no ROOT/bin). Copiamos TODAS las cudnn*.dll,
+    # porque cuDNN 9 es modular (cudnn_ops64_9.dll, cudnn_cnn64_9.dll,
+    # cudnn_graph64_9.dll, etc.) y cudnn64_9.dll las carga en runtime.
+    get_filename_component(_cudnn_root_dir "${CUDNN_INCLUDE_DIR}" DIRECTORY)
+    set(_cudnn_bin_dir "${_cudnn_root_dir}/bin/x64")
+    file(GLOB CUDNN_RUNTIME_DLLS "${_cudnn_bin_dir}/cudnn*.dll")
+    if(NOT CUDNN_RUNTIME_DLLS)
+        message(WARNING "YadraKoVa -- no se encontraron cudnn*.dll en ${_cudnn_bin_dir}. Verificar instalacion de cuDNN.")
     endif()
 
     # --- cuTENSOR DLLs (USANDO LA VERSIÓN CORRECTA) ---
@@ -231,6 +247,26 @@ function(configure_yadrakova_test test_name test_src)
                     COMMENT "Copying CUDA runtime DLLs next to ${test_name}"
             )
         endif()
+
+        # Paho MQTT (vcpkg): en Debug las DLLs viven en debug/bin y estan
+        # linkeadas contra el CRT de debug (MSVCP140D/ucrtbased), que es lo
+        # que test_memory.exe ya usa -- por eso NO se puede mezclar con las
+        # de bin/ (Release) sin arriesgar un mismatch de CRT/ABI.
+        # paho-mqtt3as (variante TLS) depende a su vez de OpenSSL -- sin
+        # libssl/libcrypto el exe no arranca (STATUS_DLL_NOT_FOUND).
+        set(_paho_bin_dir "$<IF:$<CONFIG:Debug>,${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/bin,${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin>")
+        add_custom_command(TARGET ${test_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_paho_bin_dir}/paho-mqtt3a.dll"
+                "${_paho_bin_dir}/paho-mqtt3as.dll"
+                "${_paho_bin_dir}/paho-mqtt3c.dll"
+                "${_paho_bin_dir}/paho-mqtt3cs.dll"
+                "${_paho_bin_dir}/paho-mqttpp3.dll"
+                "${_paho_bin_dir}/libssl-3-x64.dll"
+                "${_paho_bin_dir}/libcrypto-3-x64.dll"
+                $<TARGET_FILE_DIR:${test_name}>
+                COMMENT "Copying Paho MQTT + OpenSSL runtime DLLs next to ${test_name}"
+        )
     endif()
 
     add_test(NAME ${test_name} COMMAND ${test_name})
