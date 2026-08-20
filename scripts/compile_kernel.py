@@ -228,10 +228,11 @@ def parse_kernel_signature(source_text: str) -> tuple[str, list[tuple[str, str]]
     return fn_name, result
 
 
+SCALAR_DIM_TYPES = {"int64_t", "int32_t", "int", "unsigned", "unsigned int", "size_t", "uint32_t", "uint64_t"}
+
 def infer_dim_names(sig: list[tuple[str, str]]) -> list[str]:
-    """Infiere los nombres de dimensiones (escalares) del signature del kernel.
-    Un escalar es cualquier argumento que NO sea un puntero."""
-    return [name for typ, name in sig if "*" not in typ]
+    """Un escalar-dimensión es un entero pasado por valor (no struct, no puntero)."""
+    return [name for typ, name in sig if "*" not in typ and typ.strip() in SCALAR_DIM_TYPES]
 
 
 def find_dispatch_yaml(source: Path) -> Path | None:
